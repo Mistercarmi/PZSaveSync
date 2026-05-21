@@ -44,4 +44,4 @@ jobs:
 
       - name: Compile-check all modules
         run: |
-          python -m py_compile src/pzsavesync/*.py
+          python -m compileall -q src/pzsavesync

@@ -1,0 +1,39 @@
+name: ✨ Feature request
+description: Proposer une nouvelle fonctionnalité ou amélioration
+title: "[Feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci pour ton idée. Plus tu donnes de contexte sur **le scénario réel**
+        (ce que tu essaies de faire pendant tes soirées PZ), mieux je peux
+        évaluer si ça vaut le coup.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Le problème
+      description: Quelle galère / quelle friction veux-tu résoudre ?
+      placeholder: "Quand on est 4 potes et qu'on alterne l'hôte, je n'arrive pas à savoir qui a la dernière save..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: La solution que tu imagines
+      placeholder: "L'app pourrait afficher en haut..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considérées (optionnel)
+      placeholder: "J'ai essayé de faire X manuellement mais..."
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Contexte / captures (optionnel)

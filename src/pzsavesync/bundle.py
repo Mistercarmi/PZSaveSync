@@ -32,6 +32,11 @@ BUNDLE_VERSION = 2  # +1 vs v1 : champ sha256 ajouté au manifest (rétro-compat
 _REQUIRED_MANIFEST_FIELDS = ("bundle_version", "save_name", "created_at", "created_by")
 _BAD_NAME_CHARS = '<>:"/\\|?*'
 
+# Sécurité : limites max à l'extraction (anti zip-bomb)
+MAX_BUNDLE_SIZE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB compressé
+MAX_UNCOMPRESSED_SIZE_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB décompressé
+MAX_FILES_IN_BUNDLE = 50_000  # nombre max de fichiers
+
 # Callback de progression : (étape, courant, total) -> None
 # étape ∈ {"scan", "zip", "extract"} ; courant/total en octets ou en fichiers
 ProgressCb = Callable[[str, int, int], None]
@@ -89,6 +94,10 @@ def _sha256_of_zip_content(zip_path: Path) -> str:
 
 
 def zomboid_root() -> Path:
+    """Chemin Zomboid (Windows / macOS / Linux). Override via $PZ_ZOMBOID_ROOT."""
+    override = os.environ.get("PZ_ZOMBOID_ROOT")
+    if override:
+        return Path(override)
     return Path.home() / "Zomboid"
 
 
@@ -138,11 +147,25 @@ def _atomic_extract_file(zf: zipfile.ZipFile, name: str, target: Path) -> None:
         raise
 
 
+def _is_safe_mod_name(name: str) -> bool:
+    """Un nom de mod ne doit pas contenir de séparateurs de chemin ni de caractères système."""
+    if not name or len(name) > 200:
+        return False
+    if any(c in name for c in '/\\<>:"|?*\x00'):
+        return False
+    if ".." in name:
+        return False
+    return True
+
+
 def parse_ini_mods(ini_path: Path) -> tuple[list[str], list[str]]:
     """Extrait Mods= et WorkshopItems= depuis un .ini PZ.
 
     Retourne (mods, workshop_ids). Tolérant aux erreurs : retourne des listes
     vides si le fichier n'existe pas ou ne peut pas être lu.
+
+    Workshop IDs : doivent être strictement numériques (filtre les valeurs
+    bidons / tentatives d'injection).
     """
     mods: list[str] = []
     workshop_ids: list[str] = []
@@ -153,11 +176,12 @@ def parse_ini_mods(ini_path: Path) -> tuple[list[str], list[str]]:
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("Mods="):
-            mods = [m.strip() for m in line[len("Mods="):].split(";") if m.strip()]
+            raw = [m.strip() for m in line[len("Mods="):].split(";") if m.strip()]
+            mods = [m for m in raw if _is_safe_mod_name(m)]
         elif line.startswith("WorkshopItems="):
-            workshop_ids = [
-                w.strip() for w in line[len("WorkshopItems="):].split(";") if w.strip()
-            ]
+            raw = [w.strip() for w in line[len("WorkshopItems="):].split(";") if w.strip()]
+            # Un Workshop ID Steam est uniquement numérique (typiquement 9-10 chiffres)
+            workshop_ids = [w for w in raw if w.isdigit() and len(w) <= 20]
     return mods, workshop_ids
 
 
@@ -389,6 +413,33 @@ def extract_bundle(
     manifest = read_manifest(zip_path)
     save_name = manifest.save_name
     _validate_save_name(save_name)
+
+    # Anti zip-bomb : vérifier taille compressée + décompressée + nombre de fichiers
+    try:
+        compressed_size = zip_path.stat().st_size
+    except OSError:
+        compressed_size = 0
+    if compressed_size > MAX_BUNDLE_SIZE_BYTES:
+        raise ValueError(
+            f"Bundle trop gros ({compressed_size / 1024 / 1024 / 1024:.1f} GB > "
+            f"{MAX_BUNDLE_SIZE_BYTES / 1024 / 1024 / 1024:.0f} GB). "
+            f"Risque de saturation disque — extraction refusée."
+        )
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_FILES_IN_BUNDLE:
+            raise ValueError(
+                f"Bundle suspect : {len(infos)} fichiers (max {MAX_FILES_IN_BUNDLE}). "
+                f"Extraction refusée."
+            )
+        total_uncompressed = sum(i.file_size for i in infos)
+        if total_uncompressed > MAX_UNCOMPRESSED_SIZE_BYTES:
+            raise ValueError(
+                f"Bundle suspect : décompressé {total_uncompressed / 1024 / 1024 / 1024:.1f} GB > "
+                f"{MAX_UNCOMPRESSED_SIZE_BYTES / 1024 / 1024 / 1024:.0f} GB. "
+                f"Risque de saturation disque — extraction refusée."
+            )
 
     if verify_hash:
         ok, msg = verify_bundle_integrity(zip_path)

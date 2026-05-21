@@ -44,6 +44,10 @@ class ModCheckResult:
 
 
 def _zomboid_mods_dir() -> Path:
+    # Utilise la même résolution que saves.zomboid_root() (override $PZ_ZOMBOID_ROOT)
+    override = os.environ.get("PZ_ZOMBOID_ROOT")
+    if override:
+        return Path(override) / "mods"
     return Path.home() / "Zomboid" / "mods"
 
 

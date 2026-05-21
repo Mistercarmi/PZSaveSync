@@ -78,6 +78,25 @@ class SharedRepo:
         if not self.manifest_path.exists():
             self._write_manifest({"versions": []})
 
+    def cleanup_orphan_tmp_files(self) -> list[str]:
+        """Supprime les fichiers .tmp orphelins (résidus d'une opération interrompue).
+
+        Renvoie la liste des fichiers supprimés.
+        """
+        deleted: list[str] = []
+        if not self.versions_dir.exists():
+            return deleted
+        for f in self.versions_dir.iterdir():
+            if not f.is_file():
+                continue
+            if f.suffix == ".tmp" or f.name.endswith(".rwm.tmp"):
+                try:
+                    f.unlink(missing_ok=True)
+                    deleted.append(f.name)
+                except OSError:
+                    pass
+        return deleted
+
     def _write_manifest(self, data: dict) -> None:
         _atomic_write_text(self.manifest_path, json.dumps(data, indent=2))
 

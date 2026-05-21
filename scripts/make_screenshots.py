@@ -140,13 +140,17 @@ def main():
     config.CONFIG_PATH = fake_config_path
     config.APP_DIR = fake_appdata
 
-    # 3. Préparer la config factice
-    cfg = config.Config(
-        player_name=FAKE_PLAYER,
-        shared_folder=FAKE_SHARED_FOLDER,  # chemin AFFICHÉ mais le vrai est fake_shared
-        save_name="Muldraugh_Coop",
-        save_type="Multiplayer",
-    )
+    # 3. Préparer la config factice (v0.3+ : profils)
+    cfg = config.Config()
+    # Profil "default" déjà créé par défaut, on remplit ses champs via les properties
+    cfg.player_name = FAKE_PLAYER
+    cfg.shared_folder = FAKE_SHARED_FOLDER  # AFFICHÉ, mais le vrai SharedRepo pointera sur fake_shared
+    cfg.save_name = "Muldraugh_Coop"
+    cfg.save_type = "Multiplayer"
+    # Ajouter un second profil pour montrer le sélecteur multi-groupes
+    cfg.add_profile("groupe_b", "Apocalypse_Marathon")
+    cfg.onboarding_done = True
+    cfg.auto_check_updates = False  # pas de check réseau dans les screenshots
     config.save(cfg)
 
     # 4. Pour que SharedRepo fonctionne avec notre fake_shared, on remplace temporairement

@@ -61,3 +61,6 @@ PZSaveSync_LocalBackups/
 
 # Fichiers de saves PZ ou bundles (au cas où l'utilisateur les colle ici)
 *.zip
+
+# Claude Code local tooling
+.claude/

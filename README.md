@@ -6,11 +6,14 @@
 
 Juste un dossier Dropbox/Drive/OneDrive que vous avez déjà.
 
+**🇫🇷 Français** · [🇬🇧 English](README.en.md)
+
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Windows-0078d4?logo=windows&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4)
 ![GUI](https://img.shields.io/badge/GUI-customtkinter-1f6f43)
 ![License](https://img.shields.io/badge/License-Source%20Available-orange)
 ![Build PZ](https://img.shields.io/badge/Project%20Zomboid-B41%20%2F%20B42-d65a5a)
+![CI](https://github.com/Mistercarmi/PZSaveSync/actions/workflows/tests.yml/badge.svg)
 
 </div>
 
@@ -60,19 +63,28 @@ tu dois :
 4. 🔒 Pose un **verrou** ("c'est mon tour") pour empêcher les conflits
 5. 💾 **Backup auto** avant chaque restore, au cas où
 
-### ✨ Nouveautés v0.2
+### ✨ Nouveautés v0.3
 
-- 🛡 **Détecte que PZ tourne** et bloque les opérations destructives
-- ⚠ **Te prévient si ta save est en retard** sur le cloud (évite d'écraser la session d'un pote)
-- 🧩 **Vérifie les mods installés** vs requis après import — liste les manquants avec lien Workshop
-- 🔍 **Auto-détection** des dossiers Dropbox / Drive / OneDrive sur ton PC
-- 🔐 **Hash SHA256** dans le manifest — corruption de bundle détectée
-- 📊 **Barre de progression** pour les gros bundles
-- 🎯 **Wizard 3 étapes** au premier lancement
-- 💬 **Webhook Discord** pour notifier le canal à chaque push
-- 🧹 **Nettoyage de l'historique** (garde N dernières versions)
-- 🔓 **Auto-release du tour** après push (option)
-- 🎬 **Push auto à la fermeture de PZ** (option)
+- 🤖 **CI/CD GitHub Actions** — tests à chaque push, build auto du .exe sur chaque tag
+- 🆕 **Check de mise à jour** au démarrage — bannière quand une nouvelle release est dispo
+- 🪟 **Drag-and-drop d'un `.zip`** sur la fenêtre pour l'importer
+- 👥 **Profils multi-groupes** — basculer entre groupes d'amis depuis le header
+- 📝 **Logs persistants** dans `%APPDATA%/PZSaveSync/logs/` pour les rapports de bug
+- 🔔 **Notifications natives OS** (Toast Windows / notify-send / osascript)
+- 🛡 **Protection zip-bomb** à l'extraction (limites taille + nb fichiers)
+- ✅ **Validation numérique des Workshop IDs** (anti-injection)
+- 🧹 **Recovery auto** des fichiers `.tmp` orphelins au démarrage
+- 🐧 **Support Linux/macOS** (avec override `$PZ_ZOMBOID_ROOT`)
+
+### Versions précédentes ([CHANGELOG](CHANGELOG.md))
+
+**v0.2** — détection de PZ qui tourne (bloque les opérations destructives),
+bannière « save en retard », vérification des mods installés, auto-détection
+cloud, hash SHA256, nettoyage historique, webhook Discord, wizard
+d'onboarding, barre de progression.
+
+**v0.1** — release initiale avec mode cloud + manuel `.zip`, verrou de tour,
+backup auto, build `.exe` intégré.
 
 ---
 
@@ -337,17 +349,38 @@ src/pzsavesync/
   inspector.py         # lecture des chunks / DB / structures
   bundle.py            # création / extraction des .zip + manifest + SHA256
   sync.py              # SharedRepo : lock + versions + prune
-  config.py            # %APPDATA%\PZSaveSync\config.json
+  config.py            # profils multi-groupes + préférences globales
   builder.py           # build .exe via PyInstaller
   pz_detector.py       # détecte si Project Zomboid tourne
   mods_check.py        # vérifie les mods installés vs requis
   cloud_detect.py      # auto-détection Dropbox/Drive/OneDrive/...
   discord_webhook.py   # notifications Discord (stdlib pure)
+  notifications.py     # notifications natives OS (Win/Mac/Linux)
+  updater.py           # check de mise à jour via GitHub Releases
+  logger.py            # logs persistants (rotation quotidienne)
   tooltip.py           # info-bulles
 
 tests/
-  test_roundtrip.py   # cycle bundle → import → re-bundle bit-perfect
-  test_security.py    # zip-slip, validation manifest, parsing mods
+  conftest.py             # fixtures pytest partagées
+  test_roundtrip.py       # cycle bundle → import → re-bundle (intégration)
+  test_security.py        # zip-slip, validation manifest, parsing mods
+  test_bundle_security.py # limites taille, hash, validation Workshop IDs
+  test_config_migration.py # migration v0.2 → v0.3
+  test_sync_prune.py      # nettoyage historique + recovery .tmp
+  test_pz_detector.py     # détection de process
+  test_updater.py         # parsing versions
+  test_logger.py          # logger
+  test_cloud_detect.py    # auto-détection cloud
+  test_discord_webhook.py # validation URL
+
+.github/
+  workflows/
+    tests.yml          # CI : tests à chaque push/PR
+    release.yml        # CI : build auto du .exe + release sur tag v*
+  ISSUE_TEMPLATE/
+    bug_report.yml
+    feature_request.yml
+    config.yml
 
 scripts/
   make_screenshots.py # génération des screenshots avec données factices

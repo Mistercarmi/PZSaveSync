@@ -1,0 +1,81 @@
+name: 🐛 Bug report
+description: Signaler un comportement cassé dans PZ SaveSync
+title: "[Bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci de prendre le temps de signaler un bug.
+        **Avant de remplir :** vérifie que tu es bien sur la dernière version (Réglages → 🆕 Vérifier les MAJ).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version de PZ SaveSync
+      description: Affichée en bas à gauche de la fenêtre
+      placeholder: "ex. v0.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pz-build
+    attributes:
+      label: Build Project Zomboid
+      options:
+        - "Build 41 (stable)"
+        - "Build 42 (unstable)"
+        - "Autre / inconnu"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Système d'exploitation
+      options:
+        - "Windows 10"
+        - "Windows 11"
+        - "Linux"
+        - "macOS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Description du bug
+      description: Qu'est-ce qui s'est passé, et qu'est-ce que tu attendais à la place ?
+      placeholder: "Quand je clique sur Push, l'app fait X. J'attendais Y."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Étapes pour reproduire
+      placeholder: |
+        1. Ouvrir l'app
+        2. Cliquer sur "..."
+        3. Voir l'erreur
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Fichier de log
+      description: |
+        Joins le contenu de `%APPDATA%\PZSaveSync\logs\pzsavesync-YYYY-MM-DD.log`
+        (Réglages → 📝 Voir logs). Anonymise les chemins privés si besoin.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Captures d'écran / contexte
+      description: Tout ce qui pourrait aider — captures, comportement de PZ, mods inhabituels...
+    validations:
+      required: false

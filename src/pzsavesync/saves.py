@@ -1,6 +1,7 @@
 """Détection des saves PZ locales."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,18 @@ from pzsavesync import inspector
 
 
 def zomboid_root() -> Path:
+    """Renvoie le chemin du dossier Zomboid de l'utilisateur.
+
+    Cross-platform :
+    - Windows  : %USERPROFILE%/Zomboid
+    - macOS    : ~/Zomboid (PZ stocke aussi là)
+    - Linux    : ~/Zomboid (idem)
+
+    Variable d'environnement override : PZ_ZOMBOID_ROOT (chemin absolu).
+    """
+    override = os.environ.get("PZ_ZOMBOID_ROOT")
+    if override:
+        return Path(override)
     return Path.home() / "Zomboid"
 
 

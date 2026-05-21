@@ -3,6 +3,63 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.0] — 2026-05-21
+
+### Added — Distribution & dev experience
+- **CI/CD GitHub Actions** : `.github/workflows/tests.yml` lance les tests
+  + py_compile sur Windows × Python 3.11/3.12/3.13 à chaque push/PR.
+  `release.yml` build le `.exe` via PyInstaller et publie une release
+  automatiquement à chaque tag `v*` (avec notes depuis `docs/release_notes_*.md`).
+- **Auto-update check** : module `updater.py` interroge l'API GitHub Releases
+  au démarrage et affiche une bannière bleue cliquable si une nouvelle version
+  est disponible. Bouton "🆕 Vérifier les MAJ" dans Réglages aussi.
+- **Drag-and-drop d'un `.zip`** sur la fenêtre déclenche l'import (validation
+  + progress + check mods comme un import normal). Dépendance : `tkinterdnd2`.
+- **Image sociale** générée par `scripts/make_social_image.py` (1280×640)
+  pour les previews Discord/Twitter du repo.
+- **Templates GitHub** : bug report + feature request (`.github/ISSUE_TEMPLATE/`)
+  avec champs structurés (version, PZ build, OS, logs).
+- **README en anglais** (`README.en.md`) avec switcher de langue en haut.
+
+### Added — UX & fiabilité
+- **Profils multi-groupes** : tu peux maintenant avoir plusieurs profils
+  (un par groupe d'amis), chacun avec son propre pseudo, dossier partagé,
+  save active et webhook Discord. Sélecteur en haut du header, bouton `＋`
+  pour ajouter un profil. Migration silencieuse depuis v0.2 → v0.3 (le config
+  v0.2 flat devient un profil "default").
+- **Logger persistant** : module `logger.py` écrit dans
+  `%APPDATA%/PZSaveSync/logs/pzsavesync-YYYY-MM-DD.log`. Rétention 14 jours,
+  bouton "📝 Voir logs" dans Réglages. Stack traces complètes des erreurs
+  pour faciliter les bug reports.
+- **Notifications natives OS** : module `notifications.py` (Toast Windows
+  via PowerShell + WinRT, `notify-send` sous Linux, `osascript` sous macOS).
+  Toast affiché après chaque push/pull/import réussi.
+- **Recovery `.tmp` au démarrage** : nettoyage automatique des fichiers
+  `bundle_xxx.zip.tmp` orphelins (résidus d'opérations interrompues).
+- **Support Linux/macOS** : `Path.home() / "Zomboid"` au lieu de
+  `%USERPROFILE%`. Variable d'environnement `PZ_ZOMBOID_ROOT` pour override
+  manuel. Le badge platform du README est mis à jour.
+
+### Security
+- **Limites anti zip-bomb** à l'extraction : 5 GB compressé max, 20 GB
+  décompressé max, 50 000 fichiers max. Refus explicite avec message clair.
+- **Validation numérique des Workshop IDs** : un Workshop ID Steam doit être
+  uniquement composé de chiffres ; toute valeur non-numérique est filtrée
+  silencieusement par `parse_ini_mods`. Idem pour les noms de mods : refus
+  des séparateurs de chemin et `..`.
+
+### Tests
+- **Suite pytest** ajoutée : 45 tests unitaires répartis sur 10 modules
+  (`test_bundle_security`, `test_config_migration`, `test_sync_prune`,
+  `test_pz_detector`, `test_updater`, `test_logger`, `test_cloud_detect`,
+  `test_discord_webhook` en plus des 2 fichiers d'intégration existants).
+- `conftest.py` avec une fixture `fake_zomboid` réutilisable.
+
+### Changed
+- `config.py` schéma v0.3 : `{active_profile, profiles, ...globals}` au lieu
+  du schéma flat v0.2. Migration auto au chargement.
+- `requirements.txt` ajoute `tkinterdnd2>=0.4.0`.
+
 ## [0.2.0] — 2026-05-21
 
 ### Added
@@ -37,14 +94,8 @@ sémantique ([SemVer](https://semver.org/lang/fr/)).
 
 ### Changed
 - `bundle.BUNDLE_VERSION` passe à 2 (champ `sha256` ajouté au manifest).
-  Les bundles v1 sont toujours lus correctement (rétrocompat).
 - `config.Config` : nouveaux champs `auto_release_lock`, `discord_webhook`,
-  `keep_last_n_versions`, `watch_pz_process`, `onboarding_done`. Le chargement
-  filtre les champs inconnus → migration silencieuse depuis v0.1.0.
-- Onglet Réglages enrichi : sections PRÉFÉRENCES + Webhook Discord, bouton
-  "🔍 Détecter" à côté du dossier partagé, boutons "🧹 Nettoyer historique"
-  et "🎯 Relancer le wizard" dans Outils.
-- Footer affiche maintenant "🎮 PZ détecté" en vert quand PZ tourne.
+  `keep_last_n_versions`, `watch_pz_process`, `onboarding_done`.
 
 ## [0.1.0] — 2026-05-21
 

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 README
+    url: https://github.com/Mistercarmi/PZSaveSync#readme
+    about: La doc principale, FAQ, captures et explications techniques.
+  - name: 🚀 Dernière release
+    url: https://github.com/Mistercarmi/PZSaveSync/releases/latest
+    about: Télécharger la dernière version de PZSaveSync.exe.

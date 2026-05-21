@@ -16,14 +16,28 @@ from pzsavesync import (
     config,
     discord_webhook,
     inspector,
+    logger as log_mod,
     mods_check,
+    notifications,
     onboarding,
     pz_detector,
     saves,
+    updater,
 )
 from pzsavesync.progress_dialog import ProgressDialog
 from pzsavesync.sync import SharedRepo, Version
 from pzsavesync.tooltip import attach as tip
+
+# Drag-and-drop optionnel : si tkinterdnd2 n'est pas dispo, on dégrade proprement
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+    DND_FILES = None  # type: ignore
+    TkinterDnD = None  # type: ignore
+
+_log = log_mod.get("gui")
 
 LOCAL_BACKUPS = Path.home() / "PZSaveSync_LocalBackups"
 
@@ -70,10 +84,13 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 
-class App(ctk.CTk):
+_AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)
+
+
+class App(*_AppBase):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
@@ -82,11 +99,27 @@ class App(ctk.CTk):
         self.geometry("1100x800")
         self.minsize(980, 700)
         self.configure(fg_color=COLOR_BG)
+
+        # Activer le drag-and-drop si dispo
+        if _DND_AVAILABLE:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_drop)
+                _log.info("Drag-and-drop activé.")
+            except Exception as e:
+                _log.warning("Drag-and-drop indisponible : %s", e)
+
         self.cfg = config.load()
         self._save_entries: list[saves.SaveEntry] = []
         self._selected_save: str | None = self.cfg.save_name or None
         # État du polling de PZ : True quand on a vu PZ tourner au moins une fois
         self._pz_was_running = False
+        # Update info (rempli au démarrage par le check async)
+        self._update_info: updater.UpdateInfo | None = None
+
+        # Nettoyage des résidus de la session précédente
+        self._cleanup_orphan_tmp()
 
         self._build_header()
         self._build_tabs()
@@ -99,6 +132,12 @@ class App(ctk.CTk):
 
         # Polling du process PZ (toutes les 15 s)
         self._schedule_pz_poll()
+
+        # Check des mises à jour en async (1.5s après démarrage)
+        if self.cfg.auto_check_updates:
+            self.after(1500, self._check_updates_async)
+
+        _log.info("App démarrée — v%s", APP_VERSION)
 
     # ---------------------------------------------------------------- header
     def _build_header(self):
@@ -131,6 +170,33 @@ class App(ctk.CTk):
         # Statut à droite
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=12)
+
+        # Profil actif — dropdown (uniquement si > 1 profil ou si on veut le proposer)
+        self.profile_var = ctk.StringVar(value=self.cfg.current.name or "Default")
+        self.profile_menu = ctk.CTkOptionMenu(
+            right, variable=self.profile_var,
+            values=self.cfg.profile_labels(),
+            width=140, height=30,
+            font=("Segoe UI", 11),
+            fg_color=ACTION_NEUTRAL, button_color=ACTION_NEUTRAL_HOVER,
+            command=self._switch_profile,
+        )
+        self.profile_menu.pack(side="left", padx=6)
+        tip(self.profile_menu, "Profil actif (groupe d'amis). Tu peux en avoir plusieurs.")
+
+        b_add_profile = ctk.CTkButton(
+            right, text="＋", width=30, height=30,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 14, "bold"),
+            command=self._add_profile_prompt,
+        )
+        b_add_profile.pack(side="left", padx=2)
+        tip(b_add_profile, "Ajouter un nouveau profil (nouveau groupe d'amis).")
+
+        # Séparateur visuel
+        ctk.CTkFrame(right, width=1, height=24, fg_color=COLOR_BORDER).pack(
+            side="left", padx=8, pady=4
+        )
 
         self.header_user = ctk.CTkLabel(
             right, text="👤 —",
@@ -193,6 +259,20 @@ class App(ctk.CTk):
     # ============================================================== TAB PARTAGER
     def _build_tab_share(self):
         wrap = self.tab_share
+
+        # --- Bannière "update disponible" (cachée par défaut) ---
+        self.update_banner = ctk.CTkFrame(
+            wrap, fg_color="#1e3a5f", corner_radius=10,
+            border_width=1, border_color=ACTION_PULL,
+        )
+        self.update_banner_label = ctk.CTkLabel(
+            self.update_banner, text="",
+            text_color="#9bc1ed", font=("Segoe UI", 12, "bold"),
+            anchor="w", justify="left", cursor="hand2",
+        )
+        self.update_banner_label.pack(fill="x", padx=14, pady=10)
+        self.update_banner_label.bind("<Button-1>", self._open_update_url)
+        self.update_banner.bind("<Button-1>", self._open_update_url)
 
         # --- Bannière "save locale en retard" (cachée par défaut) ---
         self.late_banner = ctk.CTkFrame(
@@ -711,6 +791,35 @@ class App(ctk.CTk):
         b_wizard.pack(side="left", padx=3)
         tip(b_wizard, "Relance le wizard d'onboarding pour reconfigurer.")
 
+        # Deuxième rangée d'outils
+        adv_btns2 = ctk.CTkFrame(adv, fg_color="transparent")
+        adv_btns2.pack(fill="x", pady=(4, 0))
+        b_update = ctk.CTkButton(
+            adv_btns2, text="🆕  Vérifier les MAJ",
+            command=self._manual_update_check, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_update.pack(side="left", padx=3)
+        tip(b_update, "Interroge GitHub Releases pour savoir s'il y a une nouvelle version.")
+        b_logs = ctk.CTkButton(
+            adv_btns2, text="📝  Voir logs",
+            command=log_mod.open_logs_folder, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_logs.pack(side="left", padx=3)
+        tip(b_logs, f"Ouvre le dossier de logs ({log_mod.LOGS_DIR}). "
+                    "Joins le dernier fichier à ton bug report.")
+        b_remove_profile = ctk.CTkButton(
+            adv_btns2, text="🗑  Supprimer ce profil",
+            command=self._remove_profile_prompt, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_remove_profile.pack(side="left", padx=3)
+        tip(b_remove_profile, "Supprime le profil actif (un autre devra être actif).")
+
     # =================================================================== util
     def _huge_btn(self, parent, icon, title, sub, cmd, color="#1f4a7a"):
         """Bouton 'mega' avec icône énorme, titre et sous-titre. Tout est cliquable."""
@@ -861,6 +970,12 @@ class App(ctk.CTk):
 
     # =============================================================== refresh
     def refresh_all(self):
+        # Profil dropdown
+        if hasattr(self, "profile_menu"):
+            labels = self.cfg.profile_labels()
+            self.profile_menu.configure(values=labels)
+            self.profile_var.set(self.cfg.current.name or self.cfg.active_profile)
+
         # Header
         if self.cfg.player_name:
             self.header_user.configure(
@@ -1302,6 +1417,11 @@ class App(ctk.CTk):
                 f"Config serveur : {len(v.server_files or [])} fichier(s)"
                 + ("\n🔓 Tour libéré." if release_after else "")
             )
+            notifications.notify(
+                "PZ SaveSync — Push OK",
+                f"Bundle {save_name} ({v.size_bytes/1024/1024:.0f} MB) envoyé.",
+            )
+            _log.info("Push OK : %s", v.filename)
             self.refresh_all()
 
         dlg.run_in_thread(worker, on_done=on_done)
@@ -1433,6 +1553,7 @@ class App(ctk.CTk):
 
         def on_done(report, err):
             if err:
+                _log.error("Pull échoué : %s", err)
                 messagebox.showerror("Pull", str(err))
                 return
             self._show_extract_report(report, box=self.preview_box)
@@ -1440,6 +1561,11 @@ class App(ctk.CTk):
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
+            notifications.notify(
+                "PZ SaveSync — Pull OK",
+                f"Save '{report.save_name}' restaurée localement.",
+            )
+            _log.info("Pull OK : %s", report.save_name)
 
         dlg.run_in_thread(worker, on_done=on_done)
 
@@ -1642,6 +1768,215 @@ class App(ctk.CTk):
     # =================================================================== build
     def _build_exe(self):
         BuildWindow(self)
+
+    # ============================================================== drag-and-drop
+    def _on_drop(self, event):
+        """Un fichier a été déposé sur la fenêtre."""
+        if self._block_if_pz_running("Import (drag-and-drop)"):
+            return
+        # event.data est une string avec les chemins (entre {} si espaces)
+        raw = (event.data or "").strip()
+        # Parse simple : tkinterdnd2 wrap les paths avec {} si espaces
+        paths: list[str] = []
+        if raw.startswith("{") and raw.endswith("}"):
+            # Format "{path1} {path2}"
+            import re
+            paths = re.findall(r"\{([^}]+)\}", raw)
+        else:
+            # Pas d'espaces, paths séparés par espaces
+            paths = raw.split() if " " not in raw else [raw]
+        # Filtrer aux .zip
+        zips = [p for p in paths if p.lower().endswith(".zip")]
+        if not zips:
+            messagebox.showinfo(
+                "Drop", "Glisse un fichier .zip pour l'importer."
+            )
+            return
+        if len(zips) > 1:
+            messagebox.showinfo(
+                "Drop", f"{len(zips)} fichiers détectés — importe-les un par un."
+            )
+            zips = zips[:1]
+        # Importe le premier .zip directement
+        self._import_path(Path(zips[0]))
+
+    def _import_path(self, path: Path):
+        """Variante de _import_file qui prend un chemin déjà connu."""
+        try:
+            m = bundle_mod.read_manifest(path)
+        except Exception as e:
+            messagebox.showerror("Import", f"Bundle invalide : {e}")
+            return
+        msg = (
+            f"Tu vas importer ce bundle (glissé-déposé) :\n\n"
+            + bundle_mod.summarize_manifest(m)
+            + f"\n\n⚠ Écrasera sur TON PC :\n"
+            f"   • Zomboid\\Saves\\Multiplayer\\{m.save_name}\\\n"
+            f"   • Zomboid\\db\\{m.save_name}.db\n"
+            f"   • Zomboid\\Server\\{m.save_name}.*\n\n"
+            f"Backup avant écrasement : {LOCAL_BACKUPS}\n\nContinuer ?"
+        )
+        if not messagebox.askyesno("Importer", msg):
+            return
+
+        dlg = ProgressDialog(self, "Import en cours…")
+
+        def worker(progress_cb):
+            progress_cb("verify", 0, 1)
+            ok, vmsg = bundle_mod.verify_bundle_integrity(path)
+            if not ok:
+                raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
+            progress_cb("verify", 1, 1)
+            return bundle_mod.extract_bundle(path, backup_dir=LOCAL_BACKUPS)
+
+        def on_done(report, err):
+            if err:
+                _log.error("Import drop échoué : %s", err)
+                messagebox.showerror("Import", str(err))
+                return
+            self._show_extract_report(report, box=self.preview_box)
+            self._check_mods_for_report(report)
+            self.cfg.save_name = report.save_name
+            config.save(self.cfg)
+            self.refresh_all()
+            notifications.notify("PZ SaveSync", f"Save '{report.save_name}' importée.")
+
+        dlg.run_in_thread(worker, on_done=on_done)
+
+    # ============================================================== updates
+    def _check_updates_async(self):
+        def on_done(info: updater.UpdateInfo):
+            self._update_info = info
+            self.cfg.touch_update_check()
+            config.save(self.cfg)
+            # On programme le rendu dans le main thread
+            try:
+                self.after(0, self._render_update_banner)
+            except Exception:
+                pass
+
+        updater.check_latest_async(APP_VERSION, on_done)
+
+    def _render_update_banner(self):
+        if not self._update_info:
+            return
+        if self._update_info.available:
+            _log.info("Mise à jour disponible : %s", self._update_info.latest)
+            if hasattr(self, "update_banner"):
+                self.update_banner_label.configure(
+                    text=f"🆕  Une nouvelle version {self._update_info.latest} est disponible "
+                         f"(tu as v{APP_VERSION})  ·  clique pour télécharger"
+                )
+                try:
+                    self.update_banner.pack(fill="x", padx=16, pady=(8, 0), before=self.active_bar_ref)
+                except Exception:
+                    self.update_banner.pack(fill="x", padx=16, pady=(8, 0))
+
+    def _open_update_url(self, _event=None):
+        if self._update_info and self._update_info.download_url:
+            import webbrowser
+            webbrowser.open(self._update_info.download_url)
+
+    def _manual_update_check(self):
+        """Bouton 'Vérifier les MAJ' dans Réglages — version synchrone bloquante (4s max)."""
+        try:
+            info = updater.check_latest(APP_VERSION, timeout=5)
+        except Exception as e:
+            messagebox.showerror("Mise à jour", f"Erreur : {e}")
+            return
+        if info.error:
+            messagebox.showerror("Mise à jour", f"Échec : {info.error}")
+            return
+        if info.available:
+            if messagebox.askyesno(
+                "Mise à jour disponible",
+                f"Tu as v{info.current}.\nUne version {info.latest} est disponible.\n\n"
+                f"Ouvrir la page de téléchargement ?"
+            ):
+                import webbrowser
+                webbrowser.open(info.download_url)
+        else:
+            messagebox.showinfo(
+                "À jour", f"Tu es bien sur la dernière version (v{info.current})."
+            )
+
+    # ============================================================== profils
+    def _switch_profile(self, choice: str):
+        """Callback du dropdown profils dans le header."""
+        # choice est le 'name' du profil — il faut retrouver la clé
+        for key, p in self.cfg.profiles.items():
+            if (p.name or key) == choice:
+                self.cfg.set_active(key)
+                config.save(self.cfg)
+                self._selected_save = self.cfg.save_name or None
+                self.refresh_all()
+                _log.info("Profil actif → %s", key)
+                return
+
+    def _add_profile_prompt(self):
+        dlg = ctk.CTkInputDialog(
+            text="Nom du nouveau profil (ex. 'Groupe Muldraugh', 'Marathon B42') :",
+            title="Nouveau profil",
+        )
+        name = dlg.get_input()
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        key = "".join(c.lower() for c in name if c.isalnum() or c in "-_") or f"p{len(self.cfg.profiles)}"
+        # Garantir l'unicité
+        base = key
+        i = 1
+        while key in self.cfg.profiles:
+            i += 1
+            key = f"{base}{i}"
+        try:
+            self.cfg.add_profile(key, name)
+        except ValueError as e:
+            messagebox.showerror("Profil", str(e))
+            return
+        self.cfg.set_active(key)
+        config.save(self.cfg)
+        self.refresh_all()
+        _log.info("Profil ajouté : %s (%s)", key, name)
+
+    def _remove_profile_prompt(self):
+        if len(self.cfg.profiles) <= 1:
+            messagebox.showinfo("Profil", "Impossible de supprimer le dernier profil.")
+            return
+        current_key = self.cfg.active_profile
+        current_name = self.cfg.current.name or current_key
+        if not messagebox.askyesno(
+            "Supprimer le profil",
+            f"Supprimer le profil « {current_name} » ?\n\n"
+            "Les bundles dans le dossier partagé ne sont PAS touchés — "
+            "tu pourras les retrouver en recréant le profil."
+        ):
+            return
+        try:
+            self.cfg.remove_profile(current_key)
+        except ValueError as e:
+            messagebox.showerror("Profil", str(e))
+            return
+        config.save(self.cfg)
+        self.refresh_all()
+        _log.info("Profil supprimé : %s", current_key)
+
+    # ============================================================== tmp cleanup
+    def _cleanup_orphan_tmp(self):
+        """Au démarrage, nettoie les .tmp orphelins (résidus d'opérations crashées)."""
+        try:
+            if not self.cfg.shared_folder:
+                return
+            repo = SharedRepo(Path(self.cfg.shared_folder))
+            if not repo.versions_dir.exists():
+                return
+            deleted = repo.cleanup_orphan_tmp_files()
+            if deleted:
+                _log.info("Recovery : %d fichier(s) .tmp orphelin(s) supprimé(s)", len(deleted))
+        except Exception as e:
+            _log.warning("Cleanup .tmp : %s", e)
 
     # =========================================================== onboarding
     def _show_onboarding(self):

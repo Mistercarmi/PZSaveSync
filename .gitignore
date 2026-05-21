@@ -1,0 +1,63 @@
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# PyInstaller
+*.spec
+*.manifest
+
+# Local Python copy (run.bat installe ici si pas de Python système)
+.python/
+
+# ============ Tests / Tooling ============
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ============ IDEs ============
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============ OS ============
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.lnk
+
+# ============ Données utilisateur (jamais commit) ============
+# Config locale de l'app (peut contenir le pseudo / chemin de dossier partagé)
+config.json
+*.local.json
+
+# Backups d'imports (peuvent contenir des saves PZ)
+local_backups/
+PZSaveSync_LocalBackups/
+
+# Fichiers de saves PZ ou bundles (au cas où l'utilisateur les colle ici)
+*.zip

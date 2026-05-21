@@ -185,6 +185,83 @@ class SharedRepo:
             raise FileNotFoundError(f"Archive manquante : {archive}")
         return bundle_mod.extract_bundle(archive, backup_dir=backup_dir)
 
+    # ---------- nettoyage ----------
+    def prune_versions(
+        self,
+        keep_last_n: int | None = None,
+        older_than_days: int | None = None,
+        save_name: str | None = None,
+    ) -> list[str]:
+        """Supprime des versions selon des critères. Renvoie la liste des fichiers supprimés.
+
+        - keep_last_n : conserve les N plus récentes (par version, du plus vieux supprimé en premier)
+        - older_than_days : supprime tout ce qui est plus ancien que N jours
+        - save_name : si fourni, ne touche que les versions de cette save
+
+        Au moins un des deux critères (keep_last_n, older_than_days) est requis.
+        """
+        if keep_last_n is None and older_than_days is None:
+            raise ValueError("Préciser au moins keep_last_n ou older_than_days.")
+
+        data = self._read_manifest()
+        versions_all = data.get("versions", [])
+
+        # Filtrer la portée
+        if save_name:
+            in_scope = [v for v in versions_all if v.get("save_name") == save_name]
+            other = [v for v in versions_all if v.get("save_name") != save_name]
+        else:
+            in_scope = list(versions_all)
+            other = []
+
+        # Trier par uploaded_at croissant (plus vieux en premier)
+        in_scope.sort(key=lambda v: v.get("uploaded_at", ""))
+
+        to_delete: list[dict] = []
+
+        # Critère âge
+        if older_than_days is not None:
+            cutoff = dt.datetime.now() - dt.timedelta(days=older_than_days)
+            for v in in_scope:
+                try:
+                    ts = dt.datetime.fromisoformat(v.get("uploaded_at", ""))
+                    if ts < cutoff:
+                        to_delete.append(v)
+                except (ValueError, TypeError):
+                    continue
+
+        # Critère "garder N dernières"
+        if keep_last_n is not None and len(in_scope) > keep_last_n:
+            extras = in_scope[: len(in_scope) - keep_last_n]
+            for v in extras:
+                if v not in to_delete:
+                    to_delete.append(v)
+
+        # Effacer physiquement + mettre à jour le manifest
+        deleted_filenames: list[str] = []
+        for v in to_delete:
+            fname = v.get("filename")
+            if not fname:
+                continue
+            path = self.versions_dir / fname
+            try:
+                path.unlink(missing_ok=True)
+                deleted_filenames.append(fname)
+            except OSError:
+                pass
+
+        # Reconstruire le manifest
+        kept_scope = [v for v in in_scope if v not in to_delete]
+        data["versions"] = other + kept_scope
+        # Re-trier par date croissante pour cohérence
+        data["versions"].sort(key=lambda v: v.get("uploaded_at", ""))
+        self._write_manifest(data)
+        return deleted_filenames
+
+    def total_size_bytes(self) -> int:
+        """Somme des tailles des versions enregistrées (utile pour l'UI de nettoyage)."""
+        return sum(v.size_bytes for v in self.list_versions())
+
     # ---------- manifest ----------
     def _read_manifest(self) -> dict:
         if not self.manifest_path.exists():

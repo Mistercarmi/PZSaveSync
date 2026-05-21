@@ -60,6 +60,20 @@ tu dois :
 4. 🔒 Pose un **verrou** ("c'est mon tour") pour empêcher les conflits
 5. 💾 **Backup auto** avant chaque restore, au cas où
 
+### ✨ Nouveautés v0.2
+
+- 🛡 **Détecte que PZ tourne** et bloque les opérations destructives
+- ⚠ **Te prévient si ta save est en retard** sur le cloud (évite d'écraser la session d'un pote)
+- 🧩 **Vérifie les mods installés** vs requis après import — liste les manquants avec lien Workshop
+- 🔍 **Auto-détection** des dossiers Dropbox / Drive / OneDrive sur ton PC
+- 🔐 **Hash SHA256** dans le manifest — corruption de bundle détectée
+- 📊 **Barre de progression** pour les gros bundles
+- 🎯 **Wizard 3 étapes** au premier lancement
+- 💬 **Webhook Discord** pour notifier le canal à chaque push
+- 🧹 **Nettoyage de l'historique** (garde N dernières versions)
+- 🔓 **Auto-release du tour** après push (option)
+- 🎬 **Push auto à la fermeture de PZ** (option)
+
 ---
 
 ## 🖥 Aperçu
@@ -315,15 +329,21 @@ Voir [`tests/test_security.py`](tests/test_security.py).
 
 ```
 src/pzsavesync/
-  __main__.py      # entry point (python -m pzsavesync)
-  gui.py           # interface customtkinter (3 onglets)
-  saves.py         # détection des saves locales
-  inspector.py     # lecture des chunks / DB / structures
-  bundle.py        # création / extraction des .zip + manifest
-  sync.py          # SharedRepo : lock + versions dans le dossier partagé
-  config.py        # %APPDATA%\PZSaveSync\config.json
-  builder.py       # build .exe via PyInstaller
-  tooltip.py       # info-bulles
+  __main__.py          # entry point (python -m pzsavesync)
+  gui.py               # interface customtkinter (3 onglets)
+  onboarding.py        # wizard 3 étapes au premier lancement
+  progress_dialog.py   # dialog modal de progression
+  saves.py             # détection des saves locales
+  inspector.py         # lecture des chunks / DB / structures
+  bundle.py            # création / extraction des .zip + manifest + SHA256
+  sync.py              # SharedRepo : lock + versions + prune
+  config.py            # %APPDATA%\PZSaveSync\config.json
+  builder.py           # build .exe via PyInstaller
+  pz_detector.py       # détecte si Project Zomboid tourne
+  mods_check.py        # vérifie les mods installés vs requis
+  cloud_detect.py      # auto-détection Dropbox/Drive/OneDrive/...
+  discord_webhook.py   # notifications Discord (stdlib pure)
+  tooltip.py           # info-bulles
 
 tests/
   test_roundtrip.py   # cycle bundle → import → re-bundle bit-perfect

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import platform
 import subprocess
@@ -8,7 +9,19 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from pzsavesync import builder, bundle as bundle_mod, config, inspector, saves
+from pzsavesync import (
+    builder,
+    bundle as bundle_mod,
+    cloud_detect,
+    config,
+    discord_webhook,
+    inspector,
+    mods_check,
+    onboarding,
+    pz_detector,
+    saves,
+)
+from pzsavesync.progress_dialog import ProgressDialog
 from pzsavesync.sync import SharedRepo, Version
 from pzsavesync.tooltip import attach as tip
 
@@ -57,7 +70,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 class App(ctk.CTk):
@@ -72,11 +85,20 @@ class App(ctk.CTk):
         self.cfg = config.load()
         self._save_entries: list[saves.SaveEntry] = []
         self._selected_save: str | None = self.cfg.save_name or None
+        # État du polling de PZ : True quand on a vu PZ tourner au moins une fois
+        self._pz_was_running = False
 
         self._build_header()
         self._build_tabs()
         self._build_footer()
         self.refresh_all()
+
+        # Pop-up onboarding si premier lancement (pseudo vide ET pas marqué done)
+        if not self.cfg.player_name and not self.cfg.onboarding_done:
+            self.after(300, self._show_onboarding)
+
+        # Polling du process PZ (toutes les 15 s)
+        self._schedule_pz_poll()
 
     # ---------------------------------------------------------------- header
     def _build_header(self):
@@ -144,6 +166,12 @@ class App(ctk.CTk):
             foot, text=f"PZ SaveSync v{APP_VERSION}",
             font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM,
         ).pack(side="left", padx=12)
+        # Indicateur "PZ détecté" (vide la plupart du temps)
+        self.footer_pz_status = ctk.CTkLabel(
+            foot, text="",
+            font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM,
+        )
+        self.footer_pz_status.pack(side="left", padx=12)
         self.footer_status = ctk.CTkLabel(
             foot, text="prêt",
             font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM,
@@ -166,10 +194,25 @@ class App(ctk.CTk):
     def _build_tab_share(self):
         wrap = self.tab_share
 
+        # --- Bannière "save locale en retard" (cachée par défaut) ---
+        self.late_banner = ctk.CTkFrame(
+            wrap, fg_color="#3a2b14", corner_radius=10,
+            border_width=1, border_color=COLOR_WARN,
+        )
+        # On la pack/unpack dynamiquement dans _refresh_late_banner
+        self.late_banner_label = ctk.CTkLabel(
+            self.late_banner, text="",
+            text_color=COLOR_WARN, font=("Segoe UI", 12, "bold"),
+            anchor="w", justify="left",
+        )
+        self.late_banner_label.pack(fill="x", padx=14, pady=10)
+        # Pas de pack ici — c'est _refresh_late_banner qui décide
+
         # --- Bandeau "Partie active" ---
         active_bar = ctk.CTkFrame(wrap, fg_color=COLOR_CARD, corner_radius=10,
                                   border_width=1, border_color=COLOR_BORDER)
         active_bar.pack(fill="x", padx=16, pady=(16, 8))
+        self.active_bar_ref = active_bar  # pour pack avant cette barre la bannière retard
         self.active_label = ctk.CTkLabel(
             active_bar, text="⭐  Aucune partie active",
             font=("Segoe UI", 14, "bold"), anchor="w",
@@ -520,19 +563,73 @@ class App(ctk.CTk):
         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 4))
         self.folder_var = ctk.StringVar(value=self.cfg.shared_folder)
         e_folder = ctk.CTkEntry(
-            grid, textvariable=self.folder_var, width=500, height=34,
+            grid, textvariable=self.folder_var, width=420, height=34,
             border_width=1, border_color=COLOR_BORDER,
         )
         e_folder.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
         tip(e_folder, "Un dossier déjà synchronisé entre toi et ton pote (Dropbox, "
                       "Google Drive Desktop, OneDrive). Toi et lui devez pointer vers le MÊME contenu.")
+        b_detect = ctk.CTkButton(
+            grid, text="🔍  Détecter", width=110, height=34,
+            command=self._detect_cloud_folder,
+            fg_color=ACTION_PULL, hover_color="#3690c5",
+            font=("Segoe UI", 10),
+        )
+        b_detect.grid(row=3, column=1, padx=6, pady=(0, 14))
+        tip(b_detect, "Cherche Dropbox / Google Drive / OneDrive sur ton PC et propose des suggestions.")
         b_browse = ctk.CTkButton(
             grid, text="📁  Parcourir...", width=120, height=34,
             command=self._browse,
             fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
             font=("Segoe UI", 10),
         )
-        b_browse.grid(row=3, column=1, padx=6, pady=(0, 14))
+        b_browse.grid(row=3, column=2, padx=6, pady=(0, 14))
+
+        # --- Préférences avancées ---
+        ctk.CTkLabel(
+            grid, text="⚡   PRÉFÉRENCES",
+            font=("Segoe UI", 11, "bold"), anchor="w",
+            text_color=COLOR_TEXT_MUTED,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 4))
+        self.auto_release_var = ctk.BooleanVar(value=self.cfg.auto_release_lock)
+        cb_release = ctk.CTkCheckBox(
+            grid, text="Libérer automatiquement le tour après un push",
+            variable=self.auto_release_var, font=("Segoe UI", 11),
+        )
+        cb_release.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 6))
+        tip(cb_release, "Décoché : tu gardes le tour après ton push (rare).")
+
+        self.watch_pz_var = ctk.BooleanVar(value=self.cfg.watch_pz_process)
+        cb_watch = ctk.CTkCheckBox(
+            grid, text="Détecter quand PZ se ferme et proposer un push automatique",
+            variable=self.watch_pz_var, font=("Segoe UI", 11),
+        )
+        cb_watch.grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 6))
+        tip(cb_watch, "Polling toutes les 15s. Affiche une popup quand tu fermes Project Zomboid.")
+
+        # Webhook Discord
+        ctk.CTkLabel(
+            grid, text="💬  Webhook Discord (optionnel)",
+            font=("Segoe UI", 10, "bold"), anchor="w",
+            text_color=COLOR_TEXT_MUTED,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=14, pady=(8, 2))
+        self.webhook_var = ctk.StringVar(value=self.cfg.discord_webhook)
+        e_webhook = ctk.CTkEntry(
+            grid, textvariable=self.webhook_var, width=420, height=32,
+            placeholder_text="https://discord.com/api/webhooks/...",
+            border_width=1, border_color=COLOR_BORDER,
+        )
+        e_webhook.grid(row=8, column=0, sticky="w", padx=14, pady=(0, 12))
+        tip(e_webhook,
+            "Crée un webhook dans Server Settings → Integrations → Webhooks "
+            "et colle l'URL ici. Une notif sera envoyée à chaque push.")
+        b_test_wh = ctk.CTkButton(
+            grid, text="🧪  Tester", width=110, height=32,
+            command=self._test_webhook,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_test_wh.grid(row=8, column=1, padx=6, pady=(0, 12))
 
         # Boutons principaux — gros et visibles
         btns = ctk.CTkFrame(wrap, fg_color="transparent")
@@ -596,6 +693,23 @@ class App(ctk.CTk):
         b_backups.pack(side="left", padx=3)
         tip(b_backups, f"Ouvre {LOCAL_BACKUPS} dans l'Explorateur Windows. "
                        "C'est là que vont les sauvegardes auto avant chaque import.")
+        b_prune = ctk.CTkButton(
+            adv_btns, text="🧹  Nettoyer historique",
+            command=self._prune_versions_prompt, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_prune.pack(side="left", padx=3)
+        tip(b_prune, "Supprime les anciennes versions du dossier partagé "
+                     "pour économiser de l'espace cloud.")
+        b_wizard = ctk.CTkButton(
+            adv_btns, text="🎯  Relancer le wizard",
+            command=self._show_onboarding, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_wizard.pack(side="left", padx=3)
+        tip(b_wizard, "Relance le wizard d'onboarding pour reconfigurer.")
 
     # =================================================================== util
     def _huge_btn(self, parent, icon, title, sub, cmd, color="#1f4a7a"):
@@ -709,6 +823,13 @@ class App(ctk.CTk):
         self.cfg.player_name = self.name_var.get().strip()
         self.cfg.shared_folder = self.folder_var.get().strip()
         self.cfg.save_type = "Multiplayer"
+        # Préférences avancées (si les widgets existent)
+        if hasattr(self, "auto_release_var"):
+            self.cfg.auto_release_lock = bool(self.auto_release_var.get())
+        if hasattr(self, "watch_pz_var"):
+            self.cfg.watch_pz_process = bool(self.watch_pz_var.get())
+        if hasattr(self, "webhook_var"):
+            self.cfg.discord_webhook = self.webhook_var.get().strip()
         config.save(self.cfg)
         self.refresh_all()
         messagebox.showinfo("OK", "Configuration enregistrée.")
@@ -821,6 +942,9 @@ class App(ctk.CTk):
 
         # Cloud
         self._refresh_cloud()
+
+        # Bannière "save en retard"
+        self._refresh_late_banner()
 
     def _make_card(self, entry: saves.SaveEntry) -> ctk.CTkFrame:
         is_selected = entry.name == self._selected_save
@@ -1042,6 +1166,8 @@ class App(ctk.CTk):
         name = self._require_name()
         if not name:
             return
+        if self._block_if_pz_running("Export"):
+            return
         default = f"PZ_{save_name}_{name}.zip"
         path = filedialog.asksaveasfilename(
             title=f"Exporter la partie '{save_name}' vers...",
@@ -1053,11 +1179,19 @@ class App(ctk.CTk):
             return
         note = ctk.CTkInputDialog(text="Note pour ton pote (optionnel) :",
                                   title="Exporter").get_input() or ""
-        try:
-            m = bundle_mod.build_bundle(
+
+        dlg = ProgressDialog(self, "Export en cours…")
+
+        def worker(progress_cb):
+            return bundle_mod.build_bundle(
                 save_name=save_name, out_zip=Path(path),
-                created_by=name, note=note,
+                created_by=name, note=note, progress=progress_cb,
             )
+
+        def on_done(m, err):
+            if err:
+                messagebox.showerror("Export", str(err))
+                return
             size_mb = Path(path).stat().st_size / 1024 / 1024
             text = (
                 "✅  Bundle exporté avec succès !\n\n"
@@ -1075,32 +1209,102 @@ class App(ctk.CTk):
             box.insert("end", text)
             if messagebox.askyesno("Exporté", f"Ouvrir le dossier contenant le fichier ?\n\n{path}"):
                 _open_path(Path(path).parent)
-        except Exception as e:
-            messagebox.showerror("Export", str(e))
+
+        dlg.run_in_thread(worker, on_done=on_done)
 
     def _do_push(self, save_name: str):
         name = self._require_name()
         repo = self._repo()
         if not name or not repo:
             return
+        if self._block_if_pz_running("Push"):
+            return
         lock = repo.get_lock()
         if lock and lock.holder != name:
             if not messagebox.askyesno("Verrou",
                                        f"Le tour est à {lock.holder}. Pousser quand même ?"):
                 return
-        note = ctk.CTkInputDialog(text="Note (optionnel) :", title="Push").get_input() or ""
-        try:
-            v = repo.push_bundle(save_name, uploaded_by=name, note=note)
+        # Dialog enrichi : note + checkbox "libérer le tour après"
+        opts = PushOptionsDialog(self, default_release=self.cfg.auto_release_lock)
+        self.wait_window(opts)
+        if not opts.ok:
+            return
+        note = opts.note
+        release_after = opts.release_after
+
+        # Push en thread avec progress dialog
+        dlg = ProgressDialog(self, "Push en cours…")
+
+        def worker(progress_cb):
+            ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            safe_user = "".join(c for c in name if c.isalnum() or c in "-_") or "anon"
+            safe_save = "".join(c for c in save_name if c.isalnum() or c in "-_") or "save"
+            filename = f"bundle_{safe_save}_{ts}_{safe_user}.zip"
+            target = repo.versions_dir / filename
+            m = bundle_mod.build_bundle(
+                save_name=save_name,
+                out_zip=target,
+                created_by=name,
+                note=note,
+                progress=progress_cb,
+            )
+            # Enregistrer la version dans le manifest du repo
+            from pzsavesync.sync import Version as _V
+            v = _V(
+                filename=filename,
+                save_name=save_name,
+                uploaded_by=name,
+                uploaded_at=m.created_at,
+                size_bytes=target.stat().st_size,
+                has_db=m.has_db,
+                server_files=m.server_files,
+                note=note,
+            )
+            data = repo._read_manifest()
+            data.setdefault("versions", []).append(v.to_dict())
+            repo._write_manifest(data)
+            return v
+
+        def on_done(v, err):
+            if err:
+                messagebox.showerror("Push", str(err))
+                return
+            # Auto-release du tour
+            if release_after:
+                try:
+                    repo.release_lock(name)
+                except Exception:
+                    pass
+            # Auto-purge si configurée
+            if self.cfg.keep_last_n_versions and self.cfg.keep_last_n_versions > 0:
+                try:
+                    repo.prune_versions(keep_last_n=self.cfg.keep_last_n_versions)
+                except Exception:
+                    pass
+            # Webhook Discord
+            if self.cfg.discord_webhook:
+                try:
+                    discord_webhook.notify_push(
+                        self.cfg.discord_webhook,
+                        player=name,
+                        save_name=save_name,
+                        size_mb=v.size_bytes / 1024 / 1024,
+                        note=note,
+                        versions_count=len(repo.list_versions()),
+                    )
+                except Exception:
+                    pass
             messagebox.showinfo(
                 "Push réussi",
                 f"Bundle envoyé : {v.filename}\n"
                 f"Taille : {v.size_bytes/1024/1024:.1f} MB\n"
                 f"DB joueurs : {'oui' if v.has_db else 'NON'}\n"
                 f"Config serveur : {len(v.server_files or [])} fichier(s)"
+                + ("\n🔓 Tour libéré." if release_after else "")
             )
             self.refresh_all()
-        except Exception as e:
-            messagebox.showerror("Push", str(e))
+
+        dlg.run_in_thread(worker, on_done=on_done)
 
     # ====================================================== cloud / history
     def _refresh_cloud(self):
@@ -1197,6 +1401,8 @@ class App(ctk.CTk):
     def _pull(self):
         repo = self._repo()
         if not repo: return
+        if self._block_if_pz_running("Pull"):
+            return
         latest = repo.latest_version()
         if not latest:
             messagebox.showinfo("Pull", "Aucune version disponible dans le dossier partagé.")
@@ -1213,14 +1419,29 @@ class App(ctk.CTk):
         )
         if not messagebox.askyesno("Pull", msg):
             return
-        try:
-            report = repo.pull_bundle(latest, backup_dir=LOCAL_BACKUPS)
+
+        dlg = ProgressDialog(self, "Pull en cours…")
+
+        def worker(progress_cb):
+            progress_cb("verify", 0, 1)
+            archive = repo.versions_dir / latest.filename
+            ok, vmsg = bundle_mod.verify_bundle_integrity(archive)
+            if not ok:
+                raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
+            progress_cb("verify", 1, 1)
+            return repo.pull_bundle(latest, backup_dir=LOCAL_BACKUPS)
+
+        def on_done(report, err):
+            if err:
+                messagebox.showerror("Pull", str(err))
+                return
             self._show_extract_report(report, box=self.preview_box)
+            self._check_mods_for_report(report)
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
-        except Exception as e:
-            messagebox.showerror("Pull", str(e))
+
+        dlg.run_in_thread(worker, on_done=on_done)
 
     def _preview_diff(self):
         repo = self._repo()
@@ -1297,6 +1518,8 @@ class App(ctk.CTk):
             messagebox.showerror("Inspecter", str(e))
 
     def _import_file(self):
+        if self._block_if_pz_running("Import"):
+            return
         path = filedialog.askopenfilename(
             title="Importer un bundle reçu...",
             filetypes=[("Bundle PZSaveSync", "*.zip"), ("Tous", "*.*")],
@@ -1317,14 +1540,62 @@ class App(ctk.CTk):
             f"Backup avant écrasement : {LOCAL_BACKUPS}\n\nContinuer ?"
         )
         if not messagebox.askyesno("Importer", msg): return
-        try:
-            report = bundle_mod.extract_bundle(Path(path), backup_dir=LOCAL_BACKUPS)
+
+        dlg = ProgressDialog(self, "Import en cours…")
+
+        def worker(progress_cb):
+            progress_cb("verify", 0, 1)
+            ok, vmsg = bundle_mod.verify_bundle_integrity(Path(path))
+            if not ok:
+                raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
+            progress_cb("verify", 1, 1)
+            return bundle_mod.extract_bundle(Path(path), backup_dir=LOCAL_BACKUPS)
+
+        def on_done(report, err):
+            if err:
+                messagebox.showerror("Import", str(err))
+                return
             self._show_extract_report(report, box=self.preview_box)
+            # Vérif mods installés
+            self._check_mods_for_report(report)
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
-        except Exception as e:
-            messagebox.showerror("Import", str(e))
+
+        dlg.run_in_thread(worker, on_done=on_done)
+
+    def _check_mods_for_report(self, report):
+        """Après un import/pull, vérifie que les mods sont installés et alerte sinon."""
+        mods = getattr(report, "mods", []) or []
+        workshop = getattr(report, "workshop_items", []) or []
+        if not mods and not workshop:
+            return
+        result = mods_check.check_mods(mods, workshop)
+        if result.all_ok:
+            return
+        lines = [
+            "⚠ Certains mods requis ne sont PAS installés sur ton PC :",
+            "",
+        ]
+        if result.missing_mods:
+            lines.append(f"Mods manquants ({len(result.missing_mods)}) :")
+            for m in result.missing_mods[:10]:
+                lines.append(f"   • {m}")
+            if len(result.missing_mods) > 10:
+                lines.append(f"   … et {len(result.missing_mods) - 10} autres")
+            lines.append("")
+        if result.missing_workshop:
+            lines.append(f"Workshop IDs manquants ({len(result.missing_workshop)}) :")
+            for w in result.missing_workshop[:10]:
+                lines.append(f"   • https://steamcommunity.com/sharedfiles/filedetails/?id={w}")
+            if len(result.missing_workshop) > 10:
+                lines.append(f"   … et {len(result.missing_workshop) - 10} autres")
+            lines.append("")
+        lines.append(
+            "→ Abonne-toi à ces mods sur Steam Workshop AVANT de lancer la partie, "
+            "sinon le serveur ne démarrera pas."
+        )
+        messagebox.showwarning("Mods manquants", "\n".join(lines))
 
     def _show_extract_report(self, report, box):
         lines = [
@@ -1371,6 +1642,202 @@ class App(ctk.CTk):
     # =================================================================== build
     def _build_exe(self):
         BuildWindow(self)
+
+    # =========================================================== onboarding
+    def _show_onboarding(self):
+        try:
+            onboarding.OnboardingWizard(self, self.cfg, on_finish=self._on_onboarding_done)
+        except Exception as e:
+            print(f"[onboarding] erreur : {e}")
+
+    def _on_onboarding_done(self, cfg):
+        self.cfg = cfg
+        self.refresh_all()
+
+    # =========================================================== polling PZ
+    def _schedule_pz_poll(self):
+        if not self.cfg.watch_pz_process:
+            return
+        self.after(15000, self._poll_pz)
+
+    def _poll_pz(self):
+        try:
+            running, _ = pz_detector.is_pz_running()
+        except Exception:
+            running = False
+
+        if running:
+            self._pz_was_running = True
+            # MAJ footer pour indiquer qu'on voit PZ
+            if hasattr(self, "footer_pz_status"):
+                self.footer_pz_status.configure(
+                    text="🎮 PZ détecté", text_color=COLOR_OK,
+                )
+        else:
+            if self._pz_was_running and self.cfg.save_name:
+                # Transition running → stopped : propose un push
+                self._pz_was_running = False
+                if hasattr(self, "footer_pz_status"):
+                    self.footer_pz_status.configure(text="", text_color=COLOR_TEXT_DIM)
+                self.after(0, self._prompt_push_after_pz_close)
+            elif hasattr(self, "footer_pz_status"):
+                self.footer_pz_status.configure(text="", text_color=COLOR_TEXT_DIM)
+
+        # Re-scheduler
+        self.after(15000, self._poll_pz)
+
+    def _prompt_push_after_pz_close(self):
+        if not self.cfg.save_name:
+            return
+        msg = (
+            f"Tu viens de fermer Project Zomboid.\n\n"
+            f"Veux-tu push ta partie active « {self.cfg.save_name} » "
+            f"vers le dossier partagé maintenant ?"
+        )
+        if messagebox.askyesno("Push après session", msg):
+            self._do_push(self.cfg.save_name)
+
+    # ======================================================== check PZ running
+    def _block_if_pz_running(self, action_label: str = "Cette opération") -> bool:
+        """Si PZ tourne, prévient et bloque (renvoie True si on doit annuler)."""
+        running, names = pz_detector.is_pz_running()
+        if not running:
+            return False
+        messagebox.showwarning(
+            "Project Zomboid est en cours d'exécution",
+            f"{action_label} ne peut pas être lancée pendant que PZ tourne "
+            f"(risque de corruption de la save).\n\n"
+            f"Process détecté(s) : {', '.join(names)}\n\n"
+            f"Ferme PZ d'abord, puis réessaie."
+        )
+        return True
+
+    # ============================================================ save retard
+    def _check_save_late(self) -> str | None:
+        """Renvoie un message si la save locale active est plus vieille que le latest cloud.
+
+        Renvoie None sinon.
+        """
+        if not self.cfg.save_name or not self.cfg.shared_folder:
+            return None
+        try:
+            repo = SharedRepo(Path(self.cfg.shared_folder))
+            latest = repo.latest_version()
+        except Exception:
+            return None
+        if not latest or latest.save_name != self.cfg.save_name:
+            return None
+        # Local save mtime
+        local_save = Path.home() / "Zomboid" / "Saves" / "Multiplayer" / self.cfg.save_name
+        if not local_save.exists():
+            return None
+        try:
+            local_mtime = max(
+                f.stat().st_mtime for f in local_save.rglob("*") if f.is_file()
+            )
+        except (ValueError, OSError):
+            return None
+        local_dt = dt.datetime.fromtimestamp(local_mtime)
+        try:
+            remote_dt = dt.datetime.fromisoformat(latest.uploaded_at)
+        except (ValueError, TypeError):
+            return None
+        # Tolérance de 60s (clock skew, latence Drive)
+        if remote_dt > local_dt + dt.timedelta(seconds=60):
+            delta = remote_dt - local_dt
+            hours = delta.total_seconds() / 3600
+            if hours < 1:
+                ago = f"{int(delta.total_seconds() / 60)} min"
+            elif hours < 24:
+                ago = f"{hours:.1f} h"
+            else:
+                ago = f"{int(hours / 24)} j"
+            return (
+                f"⚠  Ta save locale est en retard sur le cloud  ·  "
+                f"dernière version par {latest.uploaded_by} il y a {ago}  ·  "
+                f"pull avant de jouer !"
+            )
+        return None
+
+    def _refresh_late_banner(self):
+        if not hasattr(self, "late_banner"):
+            return
+        msg = self._check_save_late()
+        if msg:
+            self.late_banner.pack(fill="x", padx=16, pady=(8, 0), before=self.active_bar_ref)
+            self.late_banner_label.configure(text=msg)
+        else:
+            try:
+                self.late_banner.pack_forget()
+            except Exception:
+                pass
+
+    # ============================================================ detect cloud
+    def _detect_cloud_folder(self):
+        """Bouton 'Détecter' dans Réglages : propose les dossiers cloud trouvés."""
+        found = cloud_detect.detect()
+        if not found:
+            messagebox.showinfo(
+                "Auto-détection",
+                "Aucun dossier cloud standard détecté (Dropbox, Drive, OneDrive). "
+                "Saisis le chemin à la main."
+            )
+            return
+        dlg = CloudPicker(self, found, on_pick=lambda p: self.folder_var.set(str(p)))
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
+    # ============================================================ nettoyage versions
+    def _prune_versions_prompt(self):
+        repo = self._repo()
+        if not repo:
+            return
+        versions = repo.list_versions()
+        if not versions:
+            messagebox.showinfo("Nettoyage", "Aucune version à nettoyer.")
+            return
+        total_mb = sum(v.size_bytes for v in versions) / 1024 / 1024
+        keep = ctk.CTkInputDialog(
+            text=f"Tu as {len(versions)} versions ({total_mb:.0f} MB total).\n"
+                 f"Combien veux-tu en garder (les plus récentes) ?",
+            title="Nettoyer l'historique",
+        ).get_input()
+        if keep is None:
+            return
+        try:
+            n = int(keep)
+        except ValueError:
+            messagebox.showerror("Erreur", "Saisis un nombre entier.")
+            return
+        if n < 1:
+            messagebox.showerror("Erreur", "Garde au moins 1 version.")
+            return
+        try:
+            deleted = repo.prune_versions(keep_last_n=n)
+            messagebox.showinfo(
+                "Nettoyage",
+                f"{len(deleted)} version(s) supprimée(s).\n"
+                f"Espace libéré : ~{total_mb - sum(v.size_bytes for v in repo.list_versions()) / 1024 / 1024:.0f} MB"
+            )
+            self.refresh_all()
+        except Exception as e:
+            messagebox.showerror("Nettoyage", str(e))
+
+    # ============================================================ webhook test
+    def _test_webhook(self):
+        url = self.webhook_var.get().strip()
+        if not url:
+            messagebox.showerror("Webhook", "URL vide.")
+            return
+        ok, msg = discord_webhook.notify_test(
+            url, player=self.name_var.get().strip() or "(test)",
+        )
+        if ok:
+            messagebox.showinfo("Webhook", f"✓ Test envoyé : {msg}")
+        else:
+            messagebox.showerror("Webhook", f"✗ Échec : {msg}")
 
 
 # --------------------------------------------------------------- popups
@@ -1479,6 +1946,126 @@ class BuildWindow(ctk.CTkToplevel):
     def _open_dist(self):
         dist = builder.DIST; dist.mkdir(parents=True, exist_ok=True)
         _open_path(dist)
+
+
+class PushOptionsDialog(ctk.CTkToplevel):
+    """Dialog modal pour les options du push : note + libérer le tour."""
+
+    def __init__(self, parent, default_release: bool = True):
+        super().__init__(parent)
+        self.title("Options du push")
+        self.geometry("480x260")
+        self.configure(fg_color=COLOR_BG)
+        self.resizable(False, False)
+        self.ok = False
+        self.note = ""
+        self.release_after = default_release
+        self._build_ui(default_release)
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _build_ui(self, default_release: bool):
+        card = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=10,
+                            border_width=1, border_color=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            card, text="⬆  Push vers le dossier partagé",
+            font=("Segoe UI", 13, "bold"), anchor="w",
+        ).pack(fill="x", padx=14, pady=(14, 10))
+
+        ctk.CTkLabel(
+            card, text="Note pour ton pote (optionnel) :",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED, anchor="w",
+        ).pack(fill="x", padx=14)
+        self.note_var = ctk.StringVar()
+        ctk.CTkEntry(
+            card, textvariable=self.note_var, height=34,
+            placeholder_text="ex. Fini d'explorer la mairie de Muldraugh",
+        ).pack(fill="x", padx=14, pady=(4, 12))
+
+        self.release_var = ctk.BooleanVar(value=default_release)
+        ctk.CTkCheckBox(
+            card, text="🔓  Libérer le tour après le push",
+            variable=self.release_var, font=("Segoe UI", 11),
+        ).pack(anchor="w", padx=14, pady=(0, 14))
+
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(0, 14))
+        ctk.CTkButton(
+            btns, text="Annuler", width=100, height=34,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            command=self._cancel,
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            btns, text="⬆  Push", width=120, height=34,
+            font=("Segoe UI", 11, "bold"),
+            fg_color=ACTION_PUSH, hover_color="#3da76b",
+            command=self._confirm,
+        ).pack(side="right")
+
+    def _confirm(self):
+        self.note = self.note_var.get().strip()
+        self.release_after = bool(self.release_var.get())
+        self.ok = True
+        self.destroy()
+
+    def _cancel(self):
+        self.ok = False
+        self.destroy()
+
+
+class CloudPicker(ctk.CTkToplevel):
+    """Liste les dossiers cloud détectés et permet d'en choisir un."""
+
+    def __init__(self, parent, candidates: list, on_pick):
+        super().__init__(parent)
+        self.title("Dossiers cloud détectés")
+        self.geometry("560x420")
+        self.configure(fg_color=COLOR_BG)
+        self.on_pick = on_pick
+
+        ctk.CTkLabel(
+            self, text="☁  Dossiers cloud détectés sur ton PC",
+            font=("Segoe UI", 13, "bold"), anchor="w",
+        ).pack(fill="x", padx=14, pady=(14, 4))
+        ctk.CTkLabel(
+            self, text="Clique sur un dossier pour le pré-remplir dans Réglages.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED, anchor="w",
+        ).pack(fill="x", padx=14, pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(self, fg_color=COLOR_CARD, corner_radius=8)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        for c in candidates:
+            suggested = cloud_detect.suggest_subfolder(c.path)
+            row = ctk.CTkFrame(scroll, fg_color=COLOR_BG, corner_radius=6)
+            row.pack(fill="x", padx=4, pady=4)
+            inner = ctk.CTkFrame(row, fg_color="transparent")
+            inner.pack(fill="x", padx=12, pady=8)
+            ctk.CTkLabel(
+                inner, text=f"{c.icon}  {c.label}",
+                font=("Segoe UI", 12, "bold"), anchor="w",
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                inner, text=f"   {suggested}",
+                font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+                anchor="w", justify="left",
+            ).pack(anchor="w", pady=(2, 0))
+            ctk.CTkButton(
+                inner, text=f"Utiliser ce chemin",
+                height=28, width=160,
+                fg_color=ACTION_PULL, hover_color="#3690c5",
+                font=("Segoe UI", 10),
+                command=lambda p=suggested: self._pick(p),
+            ).pack(anchor="w", pady=(6, 0))
+
+    def _pick(self, path):
+        try:
+            self.on_pick(path)
+        finally:
+            self.destroy()
 
 
 def run():

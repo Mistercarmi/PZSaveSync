@@ -16,6 +16,7 @@ le BON dossier chez le destinataire même si lui n'a jamais eu cette save avant.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import shutil
@@ -23,12 +24,17 @@ import tempfile
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 MANIFEST_FILENAME = "bundle_manifest.json"
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2  # +1 vs v1 : champ sha256 ajouté au manifest (rétro-compat à la lecture)
 _REQUIRED_MANIFEST_FIELDS = ("bundle_version", "save_name", "created_at", "created_by")
 _BAD_NAME_CHARS = '<>:"/\\|?*'
+
+# Callback de progression : (étape, courant, total) -> None
+# étape ∈ {"scan", "zip", "extract"} ; courant/total en octets ou en fichiers
+ProgressCb = Callable[[str, int, int], None]
 
 
 @dataclass
@@ -44,9 +50,42 @@ class BundleManifest:
     save_bytes: int = 0
     mods: list[str] = field(default_factory=list)
     workshop_items: list[str] = field(default_factory=list)
+    sha256: str = ""  # depuis v2 : hash du contenu (hors champ sha256 lui-même)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _sha256_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_of_zip_content(zip_path: Path) -> str:
+    """Hash du contenu du zip, en excluant le manifest (qui contient le hash lui-même).
+
+    On hash : pour chaque membre (trié), nom + taille + contenu — comme ça l'ordre
+    de compression n'influence pas le résultat.
+    """
+    h = hashlib.sha256()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = sorted(n for n in zf.namelist() if n != MANIFEST_FILENAME)
+        for name in names:
+            info = zf.getinfo(name)
+            h.update(name.encode("utf-8"))
+            h.update(b"|")
+            h.update(str(info.file_size).encode())
+            h.update(b"|")
+            with zf.open(name) as fp:
+                while True:
+                    chunk = fp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+    return h.hexdigest()
 
 
 def zomboid_root() -> Path:
@@ -146,8 +185,15 @@ def build_bundle(
     created_by: str,
     note: str = "",
     root: Path | None = None,
+    progress: ProgressCb | None = None,
 ) -> BundleManifest:
-    """Crée un bundle zip à partir d'une save locale (écriture atomique)."""
+    """Crée un bundle zip à partir d'une save locale (écriture atomique).
+
+    Si `progress` est fourni, il est appelé pendant le zip avec :
+        progress("zip", fichiers_traités, fichiers_totaux)
+    Et à la fin :
+        progress("hash", 1, 1)
+    """
     _validate_save_name(save_name)
     root = root or zomboid_root()
     save_dir = root / "Saves" / "Multiplayer" / save_name
@@ -160,6 +206,19 @@ def build_bundle(
     server_dir = root / "Server"
     db_path = root / "db" / f"{save_name}.db"
     ini_path = server_dir / f"{save_name}.ini"
+
+    # Pré-scan pour avoir le total de fichiers (pour la barre de progression)
+    if progress:
+        progress("scan", 0, 1)
+    save_files_list = [f for f in save_dir.rglob("*") if f.is_file()]
+    extra_count = (1 if db_path.exists() else 0) + sum(
+        1
+        for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua")
+        if (server_dir / f"{save_name}{suffix}").exists()
+    )
+    total = len(save_files_list) + extra_count
+    if progress:
+        progress("scan", total, total)
 
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     manifest = BundleManifest(
@@ -177,19 +236,25 @@ def build_bundle(
 
     # Écriture atomique : on écrit dans .tmp puis on rename
     tmp_zip = out_zip.with_suffix(out_zip.suffix + ".tmp")
+    done = 0
     try:
         with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             # Save folder
-            for file in save_dir.rglob("*"):
-                if file.is_file():
-                    rel = file.relative_to(save_dir)
-                    zf.write(file, f"save/{rel.as_posix()}")
-                    manifest.save_files += 1
-                    manifest.save_bytes += file.stat().st_size
+            for file in save_files_list:
+                rel = file.relative_to(save_dir)
+                zf.write(file, f"save/{rel.as_posix()}")
+                manifest.save_files += 1
+                manifest.save_bytes += file.stat().st_size
+                done += 1
+                if progress and done % 8 == 0:
+                    progress("zip", done, total)
 
             # DB
             if db_path.exists():
                 zf.write(db_path, f"db/{db_path.name}")
+                done += 1
+                if progress:
+                    progress("zip", done, total)
 
             # Server config files
             for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
@@ -197,9 +262,21 @@ def build_bundle(
                 if f.exists():
                     zf.write(f, f"server/{f.name}")
                     manifest.server_files.append(f.name)
+                    done += 1
+                    if progress:
+                        progress("zip", done, total)
 
-            # Manifest en dernier (toujours présent)
+            # Manifest provisoire (sans sha256 encore — il sera ré-écrit après hash)
             zf.writestr(MANIFEST_FILENAME, json.dumps(manifest.to_dict(), indent=2))
+
+        # Calculer le hash du contenu (hors manifest) et réécrire le manifest avec
+        if progress:
+            progress("hash", 0, 1)
+        manifest.sha256 = _sha256_of_zip_content(tmp_zip)
+        # Réécrire le manifest dans le zip avec le sha256
+        _rewrite_manifest_in_zip(tmp_zip, manifest)
+        if progress:
+            progress("hash", 1, 1)
 
         os.replace(tmp_zip, out_zip)
     except Exception:
@@ -210,6 +287,28 @@ def build_bundle(
         raise
 
     return manifest
+
+
+def _rewrite_manifest_in_zip(zip_path: Path, manifest: BundleManifest) -> None:
+    """Réécrit le manifest dans un zip existant en préservant le reste.
+
+    zipfile ne sait pas modifier en place ; on recopie dans un nouveau zip puis on remplace.
+    """
+    tmp = zip_path.with_suffix(zip_path.suffix + ".rwm.tmp")
+    try:
+        with zipfile.ZipFile(zip_path, "r") as src, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                if item.filename == MANIFEST_FILENAME:
+                    continue
+                dst.writestr(item, src.read(item.filename))
+            dst.writestr(MANIFEST_FILENAME, json.dumps(manifest.to_dict(), indent=2))
+        os.replace(tmp, zip_path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_manifest(zip_path: Path) -> BundleManifest:
@@ -254,14 +353,34 @@ class ExtractReport:
     workshop_items: list[str] = field(default_factory=list)
 
 
+def verify_bundle_integrity(zip_path: Path) -> tuple[bool, str]:
+    """Vérifie le hash SHA256 du bundle contre celui du manifest.
+
+    Renvoie (ok, message). Si le manifest n'a pas de champ sha256 (anciens
+    bundles v1), renvoie (True, "manifest sans sha256 — vérification ignorée").
+    """
+    try:
+        manifest = read_manifest(zip_path)
+    except ValueError as e:
+        return False, f"Manifest invalide : {e}"
+    if not manifest.sha256:
+        return True, "manifest sans sha256 (bundle v1) — vérification ignorée"
+    actual = _sha256_of_zip_content(zip_path)
+    if actual != manifest.sha256:
+        return False, f"Hash SHA256 ne correspond pas (bundle peut-être corrompu pendant la synchro cloud)"
+    return True, "hash SHA256 OK"
+
+
 def extract_bundle(
     zip_path: Path,
     root: Path | None = None,
     backup_dir: Path | None = None,
+    verify_hash: bool = True,
 ) -> ExtractReport:
     """Extrait un bundle dans la bonne arborescence Zomboid du destinataire.
 
     - Validation save_name + protection contre zip slip.
+    - Vérification du hash SHA256 contre le manifest (depuis bundle v2).
     - Backup automatique des fichiers qui seraient écrasés (save_dir, db,
       fichiers server) dans backup_dir/<timestamp>/...
     - Écriture atomique de chaque fichier (tmp + rename).
@@ -270,6 +389,15 @@ def extract_bundle(
     manifest = read_manifest(zip_path)
     save_name = manifest.save_name
     _validate_save_name(save_name)
+
+    if verify_hash:
+        ok, msg = verify_bundle_integrity(zip_path)
+        if not ok:
+            raise ValueError(
+                f"Bundle corrompu : {msg}. "
+                "Re-synchronise ton dossier partagé et réessaie, "
+                "ou demande à ton pote de re-pousser la version."
+            )
 
     save_dir = root / "Saves" / "Multiplayer" / save_name
     db_path = root / "db" / f"{save_name}.db"

@@ -14,7 +14,7 @@ body:
     attributes:
       label: Version de PZ SaveSync
       description: Affichée en bas à gauche de la fenêtre
-      placeholder: "ex. v0.3.0"
+      placeholder: "ex. v0.3.1"
     validations:
       required: true
 

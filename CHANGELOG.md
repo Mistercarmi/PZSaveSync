@@ -3,6 +3,16 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.1] — 2026-05-21
+
+### Fixed
+- **Freeze UI à chaque clic sur certains PC** : le polling de Project Zomboid
+  (toutes les 15 s) appelait `tasklist` de manière synchrone sur le thread UI.
+  Sur les PC où `tasklist` est lent (antivirus actif, beaucoup de process), ça
+  bloquait l'interface plusieurs secondes à chaque tick. Le poll s'exécute
+  maintenant dans un thread daemon, et le résultat est marshalé sur le main
+  thread via `self.after(0, ...)`.
+
 ## [0.3.0] — 2026-05-21
 
 ### Added — Distribution & dev experience

@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import platform
 import subprocess
+import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -84,7 +85,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 
 _AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)
@@ -1996,30 +1997,38 @@ class App(*_AppBase):
         self.after(15000, self._poll_pz)
 
     def _poll_pz(self):
-        try:
-            running, _ = pz_detector.is_pz_running()
-        except Exception:
-            running = False
+        # On exécute is_pz_running() dans un thread daemon : sur certains PC
+        # (antivirus actif, beaucoup de process) tasklist peut prendre plusieurs
+        # secondes et bloquerait sinon le main thread → freeze UI à chaque poll.
+        def worker():
+            try:
+                running, _ = pz_detector.is_pz_running()
+            except Exception:
+                running = False
+            try:
+                self.after(0, self._handle_pz_poll_result, running)
+            except Exception:
+                pass
 
+        threading.Thread(target=worker, daemon=True).start()
+        # Re-scheduler indépendamment du résultat
+        self.after(15000, self._poll_pz)
+
+    def _handle_pz_poll_result(self, running: bool):
         if running:
             self._pz_was_running = True
-            # MAJ footer pour indiquer qu'on voit PZ
             if hasattr(self, "footer_pz_status"):
                 self.footer_pz_status.configure(
                     text="🎮 PZ détecté", text_color=COLOR_OK,
                 )
         else:
             if self._pz_was_running and self.cfg.save_name:
-                # Transition running → stopped : propose un push
                 self._pz_was_running = False
                 if hasattr(self, "footer_pz_status"):
                     self.footer_pz_status.configure(text="", text_color=COLOR_TEXT_DIM)
                 self.after(0, self._prompt_push_after_pz_close)
             elif hasattr(self, "footer_pz_status"):
                 self.footer_pz_status.configure(text="", text_color=COLOR_TEXT_DIM)
-
-        # Re-scheduler
-        self.after(15000, self._poll_pz)
 
     def _prompt_push_after_pz_close(self):
         if not self.cfg.save_name:

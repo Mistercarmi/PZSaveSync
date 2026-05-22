@@ -2,492 +2,117 @@
 
 # 🎮 PZ SaveSync
 
-# 💯 100 % GRATUIT · 🔍 CODE SOURCE VISIBLE · 🚫 PAS D'ABONNEMENT
-
-**Partage tes sauvegardes Project Zomboid entre potes — sans serveur dédié, sans frais cachés, sans inscription.**
-
-Juste un dossier Dropbox/Drive/OneDrive que vous avez déjà.
+### Partage ta save Project Zomboid avec tes potes en 2 clics.
 
 **🇫🇷 Français** · [🇬🇧 English](README.en.md)
 
-![Free](https://img.shields.io/badge/Prix-Gratuit-2ecc71?style=for-the-badge)
-![Source Visible](https://img.shields.io/badge/Code-Source%20Visible-3498db?style=for-the-badge)
+![Free](https://img.shields.io/badge/100%25-Gratuit-2ecc71?style=for-the-badge)
+![Source Visible](https://img.shields.io/badge/Code-Source%20visible-3498db?style=for-the-badge)
 ![No Account](https://img.shields.io/badge/Compte-Aucun%20requis-9b59b6?style=for-the-badge)
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4)
-![GUI](https://img.shields.io/badge/GUI-customtkinter-1f6f43)
-![License](https://img.shields.io/badge/License-Source%20Available-orange)
 ![Build PZ](https://img.shields.io/badge/Project%20Zomboid-B41%20%2F%20B42-d65a5a)
-![CI](https://github.com/Mistercarmi/PZSaveSync/actions/workflows/tests.yml/badge.svg)
+![License](https://img.shields.io/badge/License-Source%20Available-orange)
 
 </div>
 
-> 💸 **Pas de paywall, pas d'achat in-app, pas de pub.** Le code est public sur GitHub
-> et vérifiable — tu peux le lire, le builder toi-même, et l'utiliser indéfiniment.
-> Voir [Licence](#-licence) pour les détails (usage perso autorisé, redistribution réservée à l'auteur).
+---
+
+## 🎯 Le problème, en 1 phrase
+
+Tu joues à PZ en multi avec tes potes. À chaque fois qu'un autre veut héberger la prochaine session, **quelqu'un doit zipper à la main 5 fichiers / dossiers**, les envoyer par WeTransfer, et croiser les doigts pour que personne n'écrase la save de l'autre.
+
+**PZ SaveSync fait ça pour toi avec 2 boutons.**
+
+![Aperçu de l'onglet Partager](docs/screenshots/01_partager.png)
 
 ---
 
-## 🎯 En 30 secondes : tu fais quoi avec cet outil ?
-
-Tu joues à PZ en multi avec tes potes. Une seule personne héberge à la fois, et il faut se passer la save quand l'hôte change. Cet outil fait **exactement deux choses** :
+## 🚀 Comment ça marche
 
 <table width="100%">
 <tr>
 <td width="50%" valign="top">
 
-### 📥 « Je veux **récupérer** la save de mon pote pour jouer »
+### 📥 Récupérer la save de ton pote
 
-Ton pote a fini sa session et a déposé sa save. Tu veux la récupérer pour héberger à ton tour.
+> *« Mon pote a fini sa session, c'est à moi d'héberger. »*
 
-→ Onglet **🔄 Partager** → bouton **⬇ Récupérer la save**
-
-L'app télécharge la dernière version, sauvegarde ton état actuel au cas où, et te dit « lance PZ → Multijoueur → Héberger ». **C'est tout.**
+Clique **⬇ Récupérer la save**.
+L'app télécharge la dernière version depuis le dossier partagé, sauvegarde ton état actuel au cas où, et te dit **« lance PZ → Multijoueur → Héberger »**.
 
 </td>
 <td width="50%" valign="top">
 
-### 📤 « Je veux **renvoyer** ma save à mes potes pour qu'ils jouent »
+### 📤 Envoyer ta save à tes potes
 
-Tu as fini ta session. Tu veux que tes potes puissent prendre la suite avec la save à jour.
+> *« J'ai joué, je veux que mon pote prenne la suite. »*
 
-→ Onglet **🔄 Partager** → bouton **⬆ Envoyer ma session**
-
-L'app bundle ton monde + DB persos + config serveur, le dépose dans le dossier partagé, et ton pote n'a plus qu'à faire **Récupérer la save** chez lui. **C'est tout.**
+Clique **⬆ Envoyer ma session**.
+L'app emballe ton monde, la DB des persos et la config serveur, le dépose dans le dossier partagé. Ton pote n'a plus qu'à cliquer **Récupérer**.
 
 </td>
 </tr>
 </table>
 
-> 🆕 **Première utilisation ?** [Setup en 3 étapes ↓](#-installation) (pseudo, dossier partagé Dropbox/Drive/OneDrive, save active)
-
-> 🔒 **Et si on push tous les deux en même temps ?** L'app pose un **verrou de tour** : un seul à la fois peut envoyer. Personne n'écrase la save de l'autre par accident. ([détails](#anti-conflit))
-
-> 💾 **Et si je fais une bêtise ?** Avant chaque récupération, un **backup auto** de ton état actuel est créé. Tu peux le restaurer en 1 clic via **Outils → ↩ Restaurer un backup**. ([nouveau en v0.3.4](CHANGELOG.md))
+> 🔒 **Personne n'écrase la save de l'autre** : un verrou de tour empêche les push concurrents.
+> 💾 **Tu peux toujours revenir en arrière** : un backup auto est créé avant chaque récupération, restaurable en 1 clic.
+> ✅ **Aucun octet n'est perdu** : transfert bit-pour-bit, hash SHA256, audit de bout en bout.
 
 ---
 
-## 🧠 Et techniquement, ça veut dire quoi « envoyer la save » ?
+## 📥 Installation (Windows, 30 secondes)
 
-PZ a besoin de 5 choses pour qu'un de tes potes puisse jouer comme s'il était l'hôte :
+1. Va dans la section [Releases](https://github.com/Mistercarmi/PZSaveSync/releases/latest)
+2. Télécharge **`PZSaveSync.exe`**
+3. Double-clique
 
-1. **Le monde** — chunks explorés, structures construites, items posés (`Zomboid\Saves\Multiplayer\<save>\`)
-2. **La DB des persos** — chaque joueur est lié à son SteamID, donc ton pote retrouve SON perso et toi le TIEN, même si l'hôte change (`Zomboid\db\<save>.db`)
-3. **La config serveur** — mods, password admin, PVP on/off, port (`Zomboid\Server\<save>.ini`)
-4. **Les réglages sandbox** — densité de zombies, vitesse, loot... (`<save>_SandboxVars.lua`)
-5. **Les zones de spawn** — où apparaissent les nouveaux joueurs (`<save>_spawnregions.lua`, + `_spawnpoints.lua` si custom)
+C'est tout. Pas de Python à installer, pas de compte à créer. Au premier lancement, un wizard te demande ton pseudo et le chemin de ton dossier Dropbox/Drive/OneDrive partagé.
 
-PZ SaveSync ramasse **les 5 ensemble**, les met dans un `.zip` signé (SHA256), et garantit que ton pote les retrouve **bit-pour-bit identiques** chez lui. Tu n'as **rien** à zipper, copier, ou renommer à la main.
+> ℹ️ Windows SmartScreen va t'avertir « éditeur inconnu » (exe non signé). Clique sur **« Informations complémentaires » → « Exécuter quand même »**.
 
----
+### Tu joues sous Linux / macOS
 
-## 📑 Sommaire
-
-- [Pourquoi cet outil existe](#-pourquoi-cet-outil-existe)
-- [Aperçu](#-aperçu)
-- [Comparé aux alternatives](#-comparé-aux-alternatives)
-- [Fonctionnement](#-fonctionnement)
-- [Comment ça gère le changement d'hôte](#-comment-ça-gère-le-changement-dhôte)
-- [Fichiers gérés](#-fichiers-gérés)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [Stack technique](#-stack-technique)
-- [FAQ](#-faq)
-- [Structure du code](#-structure-du-code)
-- [Roadmap](#-roadmap)
-- [Contribuer](#-contribuer)
-- [Licence](#-licence)
-
----
-
-## 🧟 Pourquoi cet outil existe
-
-Sans cet outil, pour passer la save entre potes tu dois :
-
-- Zipper à la main les 5 fichiers/dossiers, sans en oublier un
-- L'envoyer par WeTransfer / Drive
-- Espérer que ton pote ne se trompe pas en le rangeant chez lui
-- Croiser les doigts pour qu'aucun de vous deux n'écrase l'autre
-- Refaire ce manège à chaque changement d'hôte
-
-**PZ SaveSync remplace tout ça par 2 boutons** : `⬆ Envoyer` chez toi, `⬇ Récupérer` chez ton pote. Le reste (verrou, backup, vérif d'intégrité SHA256, renommage des fichiers serveur si besoin) est automatique.
-
-### ✨ Nouveautés v0.3
-
-- 🤖 **CI/CD GitHub Actions** — tests à chaque push, build auto du .exe sur chaque tag
-- 🆕 **Check de mise à jour** au démarrage — bannière quand une nouvelle release est dispo
-- 🪟 **Drag-and-drop d'un `.zip`** sur la fenêtre pour l'importer
-- 👥 **Profils multi-groupes** — basculer entre groupes d'amis depuis le header
-- 📝 **Logs persistants** dans `%APPDATA%/PZSaveSync/logs/` pour les rapports de bug
-- 🔔 **Notifications natives OS** (Toast Windows / notify-send / osascript)
-- 🛡 **Protection zip-bomb** à l'extraction (limites taille + nb fichiers)
-- ✅ **Validation numérique des Workshop IDs** (anti-injection)
-- 🧹 **Recovery auto** des fichiers `.tmp` orphelins au démarrage
-- 🐧 **Support Linux/macOS** (avec override `$PZ_ZOMBOID_ROOT`)
-
-### Versions précédentes ([CHANGELOG](CHANGELOG.md))
-
-**v0.2** — détection de PZ qui tourne (bloque les opérations destructives),
-bannière « save en retard », vérification des mods installés, auto-détection
-cloud, hash SHA256, nettoyage historique, webhook Discord, wizard
-d'onboarding, barre de progression.
-
-**v0.1** — release initiale avec mode cloud + manuel `.zip`, verrou de tour,
-backup auto, build `.exe` intégré.
-
----
-
-## 🖥 Aperçu
-
-### Onglet « Partager » — le hub principal
-
-![Onglet Partager](docs/screenshots/01_partager.png)
-
-Tout ce que tu fais 90 % du temps est ici : prendre le tour, récupérer la save
-de ton pote, envoyer la tienne. Les 4 gros boutons d'action gèrent les deux
-modes (cloud partagé ou fichier `.zip` envoyé à la main).
-
-### Onglet « Mes parties » — toutes tes saves locales
-
-![Onglet Mes parties](docs/screenshots/02_mes_parties.png)
-
-L'app scanne `%USERPROFILE%\Zomboid\Saves\Multiplayer\` et te montre tout ce
-qui est transférable : chunks explorés, joueurs présents en DB, mods détectés,
-fichiers compagnons (DB, .ini, sandbox, spawn).
-
-### Onglet « Réglages » — minimaliste
-
-![Onglet Réglages](docs/screenshots/03_reglages.png)
-
-Deux champs à remplir une seule fois : ton pseudo, et le chemin du dossier
-partagé. Plus un bouton « Build .exe » pour générer un exécutable autonome à
-filer à tes potes non-devs.
-
----
-
-## ⚔ Comparé aux alternatives
-
-| | **PZ SaveSync** | [PZ-Server-Save-Manager](https://github.com/pabloherresp/PZ-Server-Save-Manager) | [SaveSync (Steam)](https://store.steampowered.com/app/3832010/SaveSync_Coop_Save_Sharing_Made_Easy/) |
-|---|---|---|---|
-| Prix | **Gratuit (code source visible)** | Gratuit (GPL-3, open-source) | 5,89 € |
-| Backend | Ton Dropbox/Drive/OneDrive (déjà payé) | Local seulement | Steam Workshop (propriétaire) |
-| GUI moderne | ✅ (customtkinter) | ❌ (script Batch) | ✅ |
-| Anti-conflit (tour/lock) | ✅ | ❌ | non documenté |
-| Mode `.zip` manuel | ✅ (mail / Discord / USB) | ✅ | ❌ |
-| Inspection bundle (chunks, joueurs, diff) | ✅ | ❌ | ❌ |
-| Génère un `.exe` autonome | ✅ (PyInstaller intégré) | n/a | n/a |
-| Multi-jeux | ❌ (PZ uniquement) | ❌ (PZ) | ✅ (30+ jeux) |
-
-> 💡 **Quand utiliser SaveSync (commercial) plutôt :** si tu joues aussi à
-> Stardew / Valheim / Satisfactory et que tu veux un seul outil polyvalent payant.
->
-> 💡 **Quand utiliser PZ SaveSync :** si tu veux **gratuit + code vérifiable +
-> ton propre cloud** + le mécanisme de tour pour ton groupe PZ.
-
----
-
-## 🔄 Fonctionnement
-
-### Workflow type (cloud)
-
-```
-Pote A finit sa session  →  🔒 Prend le tour
-                         →  ⬆ Push (dépose le bundle dans le Drive partagé)
-                         →  🔓 Libère le tour
-                              ↓
-                         (le Drive synchronise tout seul)
-                              ↓
-Pote B veut héberger     →  ⬇ Pull (récupère le dernier bundle)
-                         →  Joue
-                         →  🔒 Prend le tour, ⬆ Push, 🔓 Libère
-```
-
-### Workflow type (manuel `.zip`)
-
-```
-Pote A  →  📤 Exporte ma partie → .zip → envoie par Gmail / WeTransfer / Discord
-Pote B  →  📥 Importe le .zip reçu → tout est rangé au bon endroit
-```
-
-### Anti-conflit
-
-Un fichier `lock.json` dans le dossier partagé indique qui détient le tour.
-Tant qu'il n'est pas libéré, l'app prévient les autres joueurs s'ils tentent
-de push. (Override manuel possible si quelqu'un a oublié de libérer.)
-
----
-
-## 🏠 Comment ça gère le changement d'hôte
-
-C'est LA question critique en multi-coop PZ. La réponse courte :
-**l'app ne "change" pas l'hôte explicitement, elle fait un transfert
-bit-perfect — et c'est exactement ce qu'il faut**, parce que PZ a été conçu
-pour que la save soit portable.
-
-### Ce que l'app fait
-
-Elle zippe **exactement 4 catégories de fichiers**, sans rien modifier :
-
-| Fichier | Rôle au moment du transfert |
-|---|---|
-| `Saves/Multiplayer/<save>/` | Le monde : map, chunks, structures, items |
-| `db/<save>.db` | DB SQLite avec **tous les persos de tous les joueurs** |
-| `Server/<save>.ini` | Mods + admin password + port |
-| `Server/<save>_SandboxVars.lua` + `_spawnregions.lua` | Réglages monde |
-
-À l'import, tout est extrait **au même chemin** et **avec le même nom de
-save** chez ton pote. Aucun byte n'est modifié — juste un `extractall`
-sécurisé (anti zip-slip, écriture atomique, validation du manifest).
-
-### Pourquoi ça ne casse rien (le truc important)
-
-PZ stocke les persos dans `<save>.db` **indexés par SteamID du joueur**, pas
-par "qui héberge". Conséquence :
-
-- Quand ton pote B importe la save de A et lance **Host** → PZ démarre le
-  serveur, B se connecte (son SteamID retrouve son perso dans la DB), A se
-  connecte aussi (son SteamID retrouve le sien). **Personne ne perd son perso.**
-- L'IP du serveur change forcément (c'est B maintenant) → les joueurs joignent
-  via l'IP de B au lieu de celle de A. Géré par le menu **Join** côté
-  joueurs, pas par la save.
-- Le port est dans le `.ini` → reste le même.
-
-### Les vrais points d'attention
-
-| Point | Solution PZ SaveSync |
-|---|---|
-| **Les mods** — si A avait mod X et que B ne l'a pas, le serveur ne démarre pas. | L'app **affiche la liste des mods + les liens Steam Workshop à l'import**, pour que B s'abonne avant de lancer. |
-| **Admin password** — qui est admin chez le nouvel hôte ? | Reste dans le `.ini` partagé — donc B hérite du admin pwd de A. Cohérent : on partage entre potes de confiance. |
-| **Whitelist** — B est-il autorisé à rejoindre ? | Déjà dans la DB. B est forcément accepté car il est l'hôte. |
-| **Conflits si B avait déjà une save du même nom** | **Backup auto** avant écrasement dans `~/PZSaveSync_LocalBackups/` (un zip horodaté). |
-
-### Ce que l'app NE fait PAS (et n'a pas besoin de faire)
-
-- ❌ Réécrire le SteamID dans la save → inutile, PZ utilise des SteamID multiples
-- ❌ Modifier l'IP ou le port → l'IP n'est pas dans les fichiers, le port est OK tel quel
-- ❌ "Transférer la propriété" → ce concept n'existe pas dans PZ multi-coop
-
-### Limite honnête
-
-Le seul cas où ça pourrait casser : un mod qui stocke des chemins **absolus**
-spécifiques au PC d'origine (genre `C:\Users\Alice\...`). Rare, mais
-théoriquement possible. PZ vanilla n'a pas ce problème.
-
----
-
-## 📁 Fichiers gérés
-
-Tout ce que PZ SaveSync packe pour une partie nommée `MaPartie` :
-
-| Fichier / dossier | Rôle | Si manquant... |
-|---|---|---|
-| `Zomboid\Saves\Multiplayer\MaPartie\` | Le monde (map, chunks, structures, véhicules) | Pas de transfert possible |
-| `Zomboid\db\MaPartie.db` | DB SQLite des **persos** | Vous repartez à poil |
-| `Zomboid\Server\MaPartie.ini` | Config serveur + **liste des mods** | Ton pote ne pourra pas rejoindre avec les mêmes mods |
-| `Zomboid\Server\MaPartie_SandboxVars.lua` | Réglages (zombies, vitesse...) | Réglages par défaut |
-| `Zomboid\Server\MaPartie_spawnregions.lua` | Zones de spawn perso | Zones par défaut |
-
-Les 3 fichiers du dossier `Server\` doivent **avoir exactement le même nom
-de base** que le dossier de save — c'est le contrat PZ. PZ SaveSync renomme
-automatiquement si besoin à l'import.
-
----
-
-## 📥 Installation
-
-### Depuis les sources (Python)
-
-```powershell
+```bash
 git clone https://github.com/Mistercarmi/PZSaveSync
 cd PZSaveSync
-python -m venv .venv
-.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -m pzsavesync
 ```
 
-Ou plus simple sous Windows : lance `run.bat` (le script installe Python
-3.11+ tout seul si absent, crée le venv, installe les deps, lance l'app).
+---
 
-### Depuis un `.exe` (recommandé pour tes potes non-devs)
+## 🖥 Aperçu de l'app
 
-Lance l'app, va dans **Réglages → 🛠 Build .exe**. Un `.exe` autonome est
-généré dans `dist/PZSaveSync.exe` que tu peux filer à tes potes — pas
-besoin d'installer Python chez eux.
+| Mes parties | Réglages |
+|:---:|:---:|
+| ![Mes parties](docs/screenshots/02_mes_parties.png) | ![Réglages](docs/screenshots/03_reglages.png) |
+| Toutes tes saves détectées automatiquement. Les non-exportables sont grisées. | Pseudo + dossier partagé, ça tient en 2 champs. |
 
 ---
 
-## ⚙ Configuration
+## ❓ Questions fréquentes
 
-1. **Lance l'app** (`python -m pzsavesync`, `run.bat`, ou le `.exe`)
-2. Onglet **⚙ Réglages** :
-   - Renseigne ton **pseudo** (sert à signer les bundles et le verrou)
-   - Renseigne le **dossier partagé** (chemin local synchronisé par Dropbox/Drive/OneDrive)
-3. Onglet **🎮 Mes parties** : sélectionne ta save et clique **⭐ Définir
-   comme partie active**
-4. Onglet **🔄 Partager** : tout est là — Pull, Push, Import, Export
-
-### Mettre en place un dossier partagé
-
-1. Crée un dossier sur Drive / Dropbox / OneDrive, ex. `PZ_avec_pote`
-2. Partage-le avec ton pote (droits **écriture**)
-3. Active la synchro **« miroir » / « disponible hors ligne »** pour avoir
-   un chemin local sur ton disque
-4. Toi et ton pote pointez chacun ce chemin local dans Réglages
-
----
-
-## 🧩 Stack technique
-
-- **Python 3.11+**
-- **customtkinter** ≥ 5.2 (GUI dark mode)
-- `zipfile` / `pathlib` / `json` / `sqlite3` (stdlib uniquement)
-- **PyInstaller** (optionnel, pour le build `.exe`)
-- **Pillow** (optionnel, pour `scripts/make_screenshots.py`)
-
-Tout le reste est en stdlib pour minimiser les dépendances.
-
----
-
-## ❓ FAQ
-
-**Est-ce que ça marche avec Build 41 ET Build 42 ?**
-Oui, les chemins `Zomboid\Saves\Multiplayer\` et `Zomboid\Server\` n'ont pas
-changé. Si tu joues en B42 unstable et que tu rencontres un cas non géré,
-ouvre une issue.
-
-**Et si on push tous les deux en même temps ?**
-Le verrou (`lock.json`) sert exactement à ça. Avant de push, prends le tour.
-Si l'autre joueur a le tour et tente de push, l'app le prévient. (Tu peux
-forcer une libération si l'autre a oublié.)
-
-**Les mods sont-ils inclus ?**
-Le `.ini` contient la **liste** des mods (`Mods=` et `WorkshopItems=`). Ton
-pote doit toujours les avoir installés via Steam Workshop, mais l'app
-garantit qu'il joue avec la même liste que toi — et lui affiche les liens
-Workshop à l'import pour qu'il s'abonne rapidement.
+**Et si mon pote n'a pas les mêmes mods que moi ?**
+L'app extrait la liste des mods de ta save et **affiche les liens Steam Workshop directement à l'import**. Ton pote n'a qu'à cliquer pour s'abonner.
 
 **Mon pote perd-il son perso quand il devient hôte ?**
-Non. PZ stocke les persos dans la DB SQLite, indexés par SteamID. Voir la
-[section dédiée](#-comment-ça-gère-le-changement-dhôte).
+**Non.** PZ stocke les persos dans la DB par SteamID. Quand ton pote héberge, son perso reste le sien, et toi tu retrouves le tien quand tu le rejoins.
 
-**Ça fonctionne sur Linux/Mac ?**
-Pas testé. Le code utilise `%USERPROFILE%\Zomboid` (chemin Windows). Une PR
-pour gérer `~/Zomboid` est la bienvenue.
+**Et si on push tous les deux en même temps ?**
+L'app pose un **verrou** quand quelqu'un prend le tour. Si tu tentes de push pendant que le verrou est pris, l'app te prévient.
 
-**Si je perds le dossier partagé, je perds tout ?**
-Non. À chaque import / pull, un backup auto est créé dans
-`~/PZSaveSync_LocalBackups/`. Et ton Drive/Dropbox a ses propres versions
-historiques.
+**Si je fais une erreur de manip ?**
+Avant chaque récupération, un **backup horodaté** de ton état actuel est créé dans `~/PZSaveSync_LocalBackups/`. Le bouton **↩ Restaurer un backup** te ramène à n'importe quel état précédent en 2 clics.
 
-**Est-ce sécurisé ?** L'app valide chaque bundle avant extraction (champs
-obligatoires, nom de save sain, protection contre zip-slip / path traversal).
-Voir [`tests/test_security.py`](tests/test_security.py).
-
----
-
-## 🗂 Structure du code
-
-```
-src/pzsavesync/
-  __main__.py          # entry point (python -m pzsavesync)
-  gui.py               # interface customtkinter (3 onglets)
-  onboarding.py        # wizard 3 étapes au premier lancement
-  progress_dialog.py   # dialog modal de progression
-  saves.py             # détection des saves locales
-  inspector.py         # lecture des chunks / DB / structures
-  bundle.py            # création / extraction des .zip + manifest + SHA256
-  sync.py              # SharedRepo : lock + versions + prune
-  config.py            # profils multi-groupes + préférences globales
-  builder.py           # build .exe via PyInstaller
-  pz_detector.py       # détecte si Project Zomboid tourne
-  mods_check.py        # vérifie les mods installés vs requis
-  cloud_detect.py      # auto-détection Dropbox/Drive/OneDrive/...
-  discord_webhook.py   # notifications Discord (stdlib pure)
-  notifications.py     # notifications natives OS (Win/Mac/Linux)
-  updater.py           # check de mise à jour via GitHub Releases
-  logger.py            # logs persistants (rotation quotidienne)
-  tooltip.py           # info-bulles
-
-tests/
-  conftest.py             # fixtures pytest partagées
-  test_roundtrip.py       # cycle bundle → import → re-bundle (intégration)
-  test_security.py        # zip-slip, validation manifest, parsing mods
-  test_bundle_security.py # limites taille, hash, validation Workshop IDs
-  test_config_migration.py # migration v0.2 → v0.3
-  test_sync_prune.py      # nettoyage historique + recovery .tmp
-  test_pz_detector.py     # détection de process
-  test_updater.py         # parsing versions
-  test_logger.py          # logger
-  test_cloud_detect.py    # auto-détection cloud
-  test_discord_webhook.py # validation URL
-
-.github/
-  workflows/
-    tests.yml          # CI : tests à chaque push/PR
-    release.yml        # CI : build auto du .exe + release sur tag v*
-  ISSUE_TEMPLATE/
-    bug_report.yml
-    feature_request.yml
-    config.yml
-
-scripts/
-  make_screenshots.py # génération des screenshots avec données factices
-```
-
----
-
-## 🛣 Roadmap
-
-- [ ] Support Linux/Mac (chemin `~/Zomboid`)
-- [ ] Notifications quand le tour est libéré côté pote (polling Drive)
-- [ ] Mode "diff visuel" : voir sur la map ce qui a changé entre 2 versions
-- [ ] Compression delta entre versions (au lieu de re-zipper tout le monde)
-- [ ] Détection des conflits de mods entre deux PCs
-
----
-
-## 🤝 Contribuer
-
-Les PRs sont les bienvenues. Pour les changements importants, ouvre une
-issue d'abord pour qu'on en discute.
-
-```powershell
-# Setup dev
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# Tests
-python tests/test_roundtrip.py
-python tests/test_security.py
-
-# Regénérer les screenshots (données 100% factices)
-pip install Pillow
-python scripts/make_screenshots.py
-```
+**C'est vraiment gratuit ?**
+Oui. Aucune limite, aucun compte, aucune pub, aucun achat in-app. Le code est public, tu peux le vérifier et le builder toi-même.
 
 ---
 
 ## 📜 Licence
 
-**Source Available — Tous droits réservés.** Voir [LICENSE](LICENSE).
-
-Le code source est rendu public à titre de lecture et d'apprentissage
-uniquement. Tu peux le faire tourner en local pour ton usage personnel,
-mais tu ne peux pas le copier, le modifier, le redistribuer ni l'intégrer
-dans un autre projet.
-
----
-
-## 🙏 Crédits
-
-- Outil basé sur l'observation de la structure de save documentée par la
-  communauté PZ ([PZwiki Multiplayer FAQ](https://pzwiki.net/wiki/Multiplayer_FAQ),
-  [Indifferent Broccoli — Upload a Save](https://wiki.indifferentbroccoli.com/ProjectZomboid/UploadASave))
-- Inspiré par [PZ-Server-Save-Manager](https://github.com/pabloherresp/PZ-Server-Save-Manager)
-  (script Batch, sans GUI ni lock)
+**Source Available — Tous droits réservés.** Tu peux lire le code et l'utiliser pour ton usage perso. Voir [LICENSE](LICENSE).
 
 ---
 

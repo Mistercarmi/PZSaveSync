@@ -59,7 +59,9 @@ def test_mods_extraction():
         # Verifie que ExtractReport contient aussi les mods
         with tempfile.TemporaryDirectory() as td2:
             td2 = Path(td2)
-            report = bundle_mod.extract_bundle(out, root=td2, backup_dir=None)
+            report = bundle_mod.extract_bundle(
+                out, root=td2, backup_dir=None, allow_no_backup=True,
+            )
             assert report.mods == mods
             assert report.workshop_items == workshop
             print("   [OK] ExtractReport contient les mods (visible au pote a l'import)")
@@ -87,7 +89,9 @@ def test_zip_slip_blocked():
         target_root = td / "target"
         target_root.mkdir()
         try:
-            bundle_mod.extract_bundle(malicious, root=target_root, backup_dir=None)
+            bundle_mod.extract_bundle(
+                malicious, root=target_root, backup_dir=None, allow_no_backup=True,
+            )
             raise AssertionError("ZIP slip aurait du etre rejete !")
         except ValueError as e:
             assert "traversal" in str(e).lower() or "suspect" in str(e).lower(), f"msg: {e}"

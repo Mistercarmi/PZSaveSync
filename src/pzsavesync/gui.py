@@ -22,6 +22,7 @@ from pzsavesync import (
     notifications,
     onboarding,
     pz_detector,
+    restore as restore_mod,
     saves,
     updater,
 )
@@ -85,7 +86,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.5"
 
 
 _AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)
@@ -155,10 +156,18 @@ class App(*_AppBase):
         ).pack(side="left", padx=(0, 8))
         title_block = ctk.CTkFrame(logo, fg_color="transparent")
         title_block.pack(side="left")
+        title_row = ctk.CTkFrame(title_block, fg_color="transparent")
+        title_row.pack(anchor="w")
         ctk.CTkLabel(
-            title_block, text="PZ SaveSync",
+            title_row, text="PZ SaveSync",
             font=("Segoe UI", 19, "bold"), anchor="w",
-        ).pack(anchor="w")
+        ).pack(side="left")
+        self.header_version = ctk.CTkLabel(
+            title_row, text=f"v{APP_VERSION}",
+            font=("Segoe UI", 11, "bold"), text_color=COLOR_TEXT_DIM, anchor="w",
+        )
+        self.header_version.pack(side="left", padx=(8, 0), pady=(4, 0))
+        tip(self.header_version, "Version installée. Clique sur 🆕 pour vérifier les MAJ.")
         ctk.CTkLabel(
             title_block, text="Co-op save sharing for Project Zomboid",
             font=("Segoe UI", 9), anchor="w", text_color=COLOR_TEXT_DIM,
@@ -213,6 +222,16 @@ class App(*_AppBase):
         self.header_cloud.pack(side="left", padx=10)
         tip(self.header_cloud, "Dossier partagé (Dropbox / GDrive / OneDrive) utilisé pour le mode cloud.")
 
+        self.header_update_btn = ctk.CTkButton(
+            right, text="🆕", width=36, height=30,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 14, "bold"),
+            command=self._manual_update_check,
+        )
+        self.header_update_btn.pack(side="left", padx=2)
+        tip(self.header_update_btn, "Vérifier si une nouvelle version est disponible "
+                                    "(interroge GitHub Releases).")
+
         b_refresh = ctk.CTkButton(
             right, text="↻", width=36, height=30,
             fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
@@ -249,6 +268,7 @@ class App(*_AppBase):
     def _build_tabs(self):
         tabs = ctk.CTkTabview(self, anchor="nw")
         tabs.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tabs_widget = tabs
         self.tab_share = tabs.add("🔄  Partager")
         self.tab_parties = tabs.add("🎮  Mes parties")
         self.tab_settings = tabs.add("⚙  Réglages")
@@ -260,6 +280,40 @@ class App(*_AppBase):
     # ============================================================== TAB PARTAGER
     def _build_tab_share(self):
         wrap = self.tab_share
+
+        # --- Bannière d'aide "Comment utiliser l'app" (fermable) ---
+        self.help_banner = ctk.CTkFrame(
+            wrap, fg_color="#1a2e2a", corner_radius=10,
+            border_width=1, border_color=ACTION_PUSH,
+        )
+        # On la pack seulement si l'user ne l'a pas masquée
+        if not self.cfg.hide_help_banner:
+            self.help_banner.pack(fill="x", padx=16, pady=(16, 4))
+
+        help_inner = ctk.CTkFrame(self.help_banner, fg_color="transparent")
+        help_inner.pack(fill="x", padx=14, pady=10)
+
+        help_text_block = ctk.CTkFrame(help_inner, fg_color="transparent")
+        help_text_block.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            help_text_block, text="🎯  Comment ça marche en 2 clics",
+            font=("Segoe UI", 12, "bold"), text_color="#9bd9bf",
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            help_text_block,
+            text="⬇  Récupérer la save  →  ton pote vient de jouer, tu prends le relais.    "
+                 "⬆  Envoyer ma session  →  toi tu viens de jouer, c'est au tour de ton pote.",
+            font=("Segoe UI", 11), text_color=COLOR_TEXT,
+            anchor="w", justify="left", wraplength=900,
+        ).pack(anchor="w", pady=(2, 0))
+
+        ctk.CTkButton(
+            help_inner, text="✕", width=28, height=28,
+            fg_color="transparent", hover_color=COLOR_CARD,
+            font=("Segoe UI", 13, "bold"), text_color=COLOR_TEXT_MUTED,
+            command=self._dismiss_help_banner,
+        ).pack(side="right", padx=(8, 0), anchor="n")
 
         # --- Bannière "update disponible" (cachée par défaut) ---
         self.update_banner = ctk.CTkFrame(
@@ -407,11 +461,27 @@ class App(*_AppBase):
             wrap, variable=self.manual_save_var, values=["(rescan...)"], width=1)
         # Pas pack — invisible
 
-        # --- Petite barre d'actions secondaires (en ligne, discrètes) ---
+        # --- Actions avancées (repliables sous un seul bouton) ---
         more = ctk.CTkFrame(wrap, fg_color="transparent")
         more.pack(fill="x", padx=16, pady=(10, 4))
+        # Frame qui contient les boutons avancés (toggle pack/unpack)
+        self.advanced_actions_frame = ctk.CTkFrame(more, fg_color="transparent")
+        # Pas pack par défaut : ces actions ne sont pas indispensables pour le quotidien
+        self._advanced_actions_visible = False
+
+        b_toggle_more = ctk.CTkButton(
+            more, text="⋯  Plus d'options", height=30,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+            command=self._toggle_advanced_actions,
+        )
+        b_toggle_more.pack(side="left", padx=3)
+        self._b_toggle_more = b_toggle_more
+        tip(b_toggle_more, "Affiche/cache : inspection d'un .zip, diff local/remote, "
+                           "inspection d'une version précise. Utile en mode debug.")
+
         b_inspect = ctk.CTkButton(
-            more, text="🔍  Inspecter un .zip", height=30,
+            self.advanced_actions_frame, text="🔍  Inspecter un .zip", height=30,
             fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
             font=("Segoe UI", 10), command=self._inspect_file,
         )
@@ -419,7 +489,7 @@ class App(*_AppBase):
         tip(b_inspect, "Affiche le manifeste et le contenu d'un .zip sans rien installer.")
 
         b_diff = ctk.CTkButton(
-            more, text="↔  Diff local / remote", height=30,
+            self.advanced_actions_frame, text="↔  Diff local / remote", height=30,
             fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
             font=("Segoe UI", 10), command=self._preview_diff,
         )
@@ -427,7 +497,7 @@ class App(*_AppBase):
         tip(b_diff, "Compare ta save locale active à la dernière version partagée.")
 
         b_pick = ctk.CTkButton(
-            more, text="🕓  Inspecter une version...", height=30,
+            self.advanced_actions_frame, text="🕓  Inspecter une version...", height=30,
             fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
             font=("Segoe UI", 10), command=self._preview_pick,
         )
@@ -774,6 +844,16 @@ class App(*_AppBase):
         b_backups.pack(side="left", padx=3)
         tip(b_backups, f"Ouvre {LOCAL_BACKUPS} dans l'Explorateur Windows. "
                        "C'est là que vont les sauvegardes auto avant chaque import.")
+        b_restore = ctk.CTkButton(
+            adv_btns, text="↩  Restaurer un backup",
+            command=self._restore_backup_prompt, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_restore.pack(side="left", padx=3)
+        tip(b_restore, "Restaure une save (monde + DB + config) depuis un backup local. "
+                       "Idéal si tu viens de pull/import par erreur. Un backup de l'état "
+                       "actuel est fait avant la restauration.")
         b_prune = ctk.CTkButton(
             adv_btns, text="🧹  Nettoyer historique",
             command=self._prune_versions_prompt, height=32,
@@ -791,6 +871,26 @@ class App(*_AppBase):
         )
         b_wizard.pack(side="left", padx=3)
         tip(b_wizard, "Relance le wizard d'onboarding pour reconfigurer.")
+
+        b_show_help = ctk.CTkButton(
+            adv_btns, text="❓  Réafficher l'aide",
+            command=self._show_help_banner, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_show_help.pack(side="left", padx=3)
+        tip(b_show_help, "Réaffiche la bannière 'Comment ça marche' en haut de l'onglet Partager.")
+
+        b_repo_check = ctk.CTkButton(
+            adv_btns, text="🩺  Vérifier le repo cloud",
+            command=self._repo_health_check, height=32,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+        )
+        b_repo_check.pack(side="left", padx=3)
+        tip(b_repo_check, "Vérifie l'intégrité du dossier partagé : détecte les .zip "
+                          "orphelins (présents mais invisibles), les entrées sans "
+                          ".zip physique, et les .tmp résiduels. Propose de réparer.")
 
         # Deuxième rangée d'outils
         adv_btns2 = ctk.CTkFrame(adv, fg_color="transparent")
@@ -969,6 +1069,202 @@ class App(*_AppBase):
         LOCAL_BACKUPS.mkdir(parents=True, exist_ok=True)
         _open_path(LOCAL_BACKUPS)
 
+    def _dismiss_help_banner(self):
+        """Ferme la bannière d'aide et persiste la préférence."""
+        try:
+            self.help_banner.pack_forget()
+        except Exception:
+            pass
+        self.cfg.hide_help_banner = True
+        config.save(self.cfg)
+
+    def _repo_health_check(self):
+        """Vérifie l'intégrité du dossier partagé et propose des corrections."""
+        repo = self._repo()
+        if not repo:
+            return
+        try:
+            health = repo.health_check()
+        except Exception as e:
+            messagebox.showerror("Health check", f"Erreur : {e}")
+            return
+        if health.is_healthy:
+            messagebox.showinfo(
+                "Repo cloud OK",
+                "✅ Aucun problème détecté.\n\n"
+                "Toutes les versions du manifest ont leur .zip physique, "
+                "aucun .zip orphelin, aucun fichier .tmp résiduel.",
+            )
+            return
+
+        # Construire le résumé + propositions
+        lines = [
+            "⚠ Problèmes détectés dans le dossier partagé :",
+            "",
+        ]
+        if health.orphan_files:
+            lines.append(f"🔸 {len(health.orphan_files)} .zip orphelin(s) — présents "
+                         f"mais invisibles via Pull :")
+            for n in health.orphan_files[:6]:
+                lines.append(f"   • {n}")
+            if len(health.orphan_files) > 6:
+                lines.append(f"   … et {len(health.orphan_files) - 6} autre(s)")
+            lines.append(
+                f"   → {len(health.readable_orphans)} réintégrable(s) "
+                f"automatiquement (lisible(s))."
+            )
+            lines.append("")
+        if health.missing_files:
+            lines.append(f"🔸 {len(health.missing_files)} entrée(s) sans .zip physique "
+                         f"(synchro cloud échouée ou .zip supprimé manuellement) :")
+            for n in health.missing_files[:6]:
+                lines.append(f"   • {n}")
+            if len(health.missing_files) > 6:
+                lines.append(f"   … et {len(health.missing_files) - 6} autre(s)")
+            lines.append("")
+        if health.tmp_residues:
+            lines.append(f"🔸 {len(health.tmp_residues)} fichier(s) .tmp résiduel(s).")
+            lines.append("")
+        lines.append("Réparer maintenant ?")
+        lines.append("  • Réintégrer les orphelins lisibles dans le manifest")
+        lines.append("  • Supprimer les entrées fantômes du manifest")
+        lines.append("  • Nettoyer les .tmp")
+
+        if not messagebox.askyesno("Repo cloud — anomalies", "\n".join(lines)):
+            return
+
+        # Réparation
+        try:
+            adopted = repo.adopt_orphans(health.readable_orphans)
+            removed = repo.remove_missing_from_manifest(health.missing_files)
+            tmp_cleaned = repo.cleanup_orphan_tmp_files()
+            messagebox.showinfo(
+                "Réparation effectuée",
+                f"✅ {adopted} bundle(s) orphelin(s) réintégré(s).\n"
+                f"✅ {removed} entrée(s) fantôme(s) retirée(s) du manifest.\n"
+                f"✅ {len(tmp_cleaned)} fichier(s) .tmp nettoyé(s).",
+            )
+            self.refresh_all()
+        except Exception as e:
+            messagebox.showerror("Réparation", f"Erreur : {e}")
+
+    def _toggle_advanced_actions(self):
+        """Affiche/cache les boutons avancés (inspecter, diff, etc.)."""
+        if self._advanced_actions_visible:
+            self.advanced_actions_frame.pack_forget()
+            self._b_toggle_more.configure(text="⋯  Plus d'options")
+            self._advanced_actions_visible = False
+        else:
+            self.advanced_actions_frame.pack(side="left", padx=(8, 0))
+            self._b_toggle_more.configure(text="✕  Moins d'options")
+            self._advanced_actions_visible = True
+
+    def _show_help_banner(self):
+        """Réaffiche la bannière (depuis Réglages)."""
+        self.cfg.hide_help_banner = False
+        config.save(self.cfg)
+        try:
+            # Re-pack en haut de l'onglet, avant tout le reste
+            self.help_banner.pack(
+                fill="x", padx=16, pady=(16, 4), before=self.update_banner,
+            )
+        except Exception:
+            try:
+                self.help_banner.pack(fill="x", padx=16, pady=(16, 4))
+            except Exception:
+                pass
+        # Bascule sur l'onglet Partager pour qu'on la voie
+        try:
+            self.tabs_widget.set("🔄  Partager")
+        except Exception:
+            pass
+
+    def _restore_backup_prompt(self):
+        """Affiche la liste des backups locaux et permet d'en restaurer un."""
+        if self._block_if_pz_running("Restauration de backup"):
+            return
+        LOCAL_BACKUPS.mkdir(parents=True, exist_ok=True)
+        backups = restore_mod.list_backups(LOCAL_BACKUPS)
+        if not backups:
+            messagebox.showinfo(
+                "Restauration",
+                f"Aucun backup local trouvé dans :\n{LOCAL_BACKUPS}\n\n"
+                "Les backups sont créés automatiquement avant chaque pull/import.",
+            )
+            return
+        BackupPicker(self, backups, on_pick=self._do_restore_backup)
+
+    def _do_restore_backup(self, backup: "restore_mod.BackupEntry"):
+        # Confirmation explicite — c'est une opération destructive de l'état courant
+        details = []
+        if backup.has_save_zip:
+            details.append("• Monde (save.zip)")
+        if backup.has_db:
+            details.append(f"• DB joueurs ({backup.save_name}.db)")
+        if backup.db_companions:
+            details.append(f"• Compagnons SQLite : {', '.join(backup.db_companions)}")
+        if backup.server_files:
+            details.append(f"• Config serveur : {len(backup.server_files)} fichier(s)")
+        msg = (
+            f"Restaurer le backup :\n"
+            f"   Save : {backup.save_name}\n"
+            f"   Date : {backup.display_timestamp}\n"
+            f"   Taille : {backup.size_bytes / 1024 / 1024:.1f} MB\n\n"
+            f"Contenu :\n" + "\n".join(details) + "\n\n"
+            f"⚠ Ton état actuel pour '{backup.save_name}' sera ÉCRASÉ.\n"
+            f"Un backup pré-restauration est créé avant — récupérable.\n\nContinuer ?"
+        )
+        if not messagebox.askyesno("Restaurer", msg):
+            return
+
+        dlg = ProgressDialog(self, "Restauration en cours…")
+
+        def worker(progress_cb):
+            progress_cb("restore", 0, 1)
+            r = restore_mod.restore_backup(
+                backup, safety_backup_dir=LOCAL_BACKUPS,
+            )
+            progress_cb("restore", 1, 1)
+            return r
+
+        def on_done(report, err):
+            if err:
+                _log.error("Restauration échouée : %s", err)
+                messagebox.showerror("Restauration", str(err))
+                return
+            lines = [
+                "✅ Backup restauré avec succès",
+                "",
+                f"Save     : {report.save_name}",
+                f"Dossier  : {report.save_dir}",
+                f"DB       : {report.db_path or '(non incluse dans le backup)'}",
+            ]
+            if report.db_companions_restored:
+                lines.append(
+                    f"DB WAL   : {', '.join(p.name for p in report.db_companions_restored)}"
+                )
+            lines.append(f"Config   : {len(report.server_files)} fichier(s) serveur")
+            for f in report.server_files:
+                lines.append(f"   • {f.name}")
+            if report.pre_restore_backup:
+                lines.append("")
+                lines.append(f"💾 Backup pré-restauration : {report.pre_restore_backup}")
+            lines.append("")
+            lines.append("→ Lance Project Zomboid → Multijoueur → Héberger.")
+            text = "\n".join(lines)
+            self.preview_box.delete("1.0", "end")
+            self.preview_box.insert("end", text)
+            self.cfg.save_name = report.save_name
+            config.save(self.cfg)
+            self.refresh_all()
+            notifications.notify(
+                "PZ SaveSync — Restauration OK",
+                f"Save '{report.save_name}' restaurée depuis le backup.",
+            )
+            _log.info("Restore OK : %s depuis %s", report.save_name, backup.path)
+
+        dlg.run_in_thread(worker, on_done=on_done)
+
     # =============================================================== refresh
     def refresh_all(self):
         # Profil dropdown
@@ -1065,7 +1361,15 @@ class App(*_AppBase):
     def _make_card(self, entry: saves.SaveEntry) -> ctk.CTkFrame:
         is_selected = entry.name == self._selected_save
         is_active = entry.name == self.cfg.save_name
-        bg = COLOR_CARD_SEL if is_selected else COLOR_CARD
+        is_transferable = entry.transferable
+        # Couleurs grisées pour les saves non-transférables
+        if is_selected:
+            bg = COLOR_CARD_SEL
+        elif is_transferable:
+            bg = COLOR_CARD
+        else:
+            # Fond plus sombre que COLOR_CARD pour signaler "désactivé"
+            bg = "#1c1e23"
         border_color = COLOR_STAR if is_active else (
             "#4d7eb8" if is_selected else COLOR_BORDER
         )
@@ -1075,12 +1379,20 @@ class App(*_AppBase):
         )
         card.pack(fill="x", padx=4, pady=4)
 
+        # Couleurs du texte selon transférabilité
+        title_color = COLOR_TEXT if is_transferable or is_selected else COLOR_TEXT_DIM
+        sub_color = (
+            COLOR_TEXT if is_selected
+            else ("#bcbfc6" if is_transferable else COLOR_TEXT_DIM)
+        )
+
         icon = "🌍" if entry.is_server_save else ("👤" if entry.is_client_save else "❓")
         line1 = ctk.CTkFrame(card, fg_color="transparent")
         line1.pack(fill="x", padx=12, pady=(10, 0))
         ctk.CTkLabel(
             line1, text=f"{icon}  {entry.name}",
             font=("Segoe UI", 12, "bold"), anchor="w",
+            text_color=title_color,
         ).pack(side="left")
 
         if is_active:
@@ -1100,14 +1412,14 @@ class App(*_AppBase):
         sub = f"{size_mb:.1f} MB  •  {entry.info.map_chunks} chunks  •  {players}\n{last}"
         ctk.CTkLabel(
             card, text=sub, font=("Segoe UI", 10),
-            text_color=COLOR_TEXT if is_selected else "#bcbfc6",
+            text_color=sub_color,
             anchor="w", justify="left",
         ).pack(fill="x", padx=12, pady=(2, 4))
 
         # Tag transférable (compact)
         bar = ctk.CTkFrame(card, fg_color="transparent")
         bar.pack(fill="x", padx=12, pady=(0, 10))
-        if entry.transferable:
+        if is_transferable:
             t = ctk.CTkLabel(
                 bar, text="✓  transférable",
                 text_color=COLOR_OK, font=("Segoe UI", 9, "bold"),
@@ -1117,18 +1429,24 @@ class App(*_AppBase):
                    "save + DB + config et la transférer à ton pote.")
         else:
             t = ctk.CTkLabel(
-                bar, text="∅  non transférable",
-                text_color=COLOR_TEXT_DIM, font=("Segoe UI", 9),
+                bar, text="🚫  non exportable",
+                text_color=COLOR_TEXT_DIM, font=("Segoe UI", 9, "bold"),
             )
             t.pack(side="left")
             tip(t, "Ce dossier est probablement une save client (toi qui rejoins un serveur), "
-                   "pas un serveur que tu héberges.")
+                   "pas un serveur que tu héberges. Tu peux la consulter mais pas l'envoyer "
+                   "à un pote — il faut être l'hôte.")
 
         def on_click(_e=None, n=entry.name):
             self._select_save(n)
 
-        # Hover doux pour les cartes non-sélectionnées
-        hover_bg = COLOR_CARD_HOVER if not is_selected else bg
+        # Hover doux pour les cartes non-sélectionnées (encore plus discret pour les grisées)
+        if is_selected:
+            hover_bg = bg
+        elif is_transferable:
+            hover_bg = COLOR_CARD_HOVER
+        else:
+            hover_bg = "#23262c"  # à peine plus clair que #1c1e23
 
         def _enter(_e, c=card, b=hover_bg):
             c.configure(fg_color=b)
@@ -1157,7 +1475,15 @@ class App(*_AppBase):
     def _select_save(self, name: str):
         self._selected_save = name
         for n, card in self._save_cards.items():
-            card.configure(fg_color=COLOR_CARD_SEL if n == name else COLOR_CARD)
+            if n == name:
+                card.configure(fg_color=COLOR_CARD_SEL)
+            else:
+                # Couleur de fond selon transférabilité (cohérent avec _make_card)
+                entry = next((e for e in self._save_entries if e.name == n), None)
+                is_transferable = entry.transferable if entry else True
+                card.configure(
+                    fg_color=COLOR_CARD if is_transferable else "#1c1e23"
+                )
         entry = next((e for e in self._save_entries if e.name == name), None)
         self._update_detail(entry)
 
@@ -1391,10 +1717,15 @@ class App(*_AppBase):
                     repo.release_lock(name)
                 except Exception:
                     pass
-            # Auto-purge si configurée
+            # Auto-purge si configurée — IMPORTANT : scoped à save_name pour ne
+            # pas supprimer les versions des AUTRES saves du repo (un repo
+            # partagé peut contenir plusieurs mondes, ex: 'Gitano_Z' + 'Test').
             if self.cfg.keep_last_n_versions and self.cfg.keep_last_n_versions > 0:
                 try:
-                    repo.prune_versions(keep_last_n=self.cfg.keep_last_n_versions)
+                    repo.prune_versions(
+                        keep_last_n=self.cfg.keep_last_n_versions,
+                        save_name=save_name,
+                    )
                 except Exception:
                     pass
             # Webhook Discord
@@ -1872,6 +2203,16 @@ class App(*_AppBase):
                     self.update_banner.pack(fill="x", padx=16, pady=(8, 0), before=self.active_bar_ref)
                 except Exception:
                     self.update_banner.pack(fill="x", padx=16, pady=(8, 0))
+            # Highlight le bouton MAJ du header
+            if hasattr(self, "header_update_btn"):
+                self.header_update_btn.configure(
+                    fg_color=COLOR_WARN, hover_color="#d4a017",
+                )
+            if hasattr(self, "header_version"):
+                self.header_version.configure(
+                    text=f"v{APP_VERSION} → v{self._update_info.latest}",
+                    text_color=COLOR_WARN,
+                )
 
     def _open_update_url(self, _event=None):
         if self._update_info and self._update_info.download_url:
@@ -2143,9 +2484,17 @@ class App(*_AppBase):
             messagebox.showinfo("Nettoyage", "Aucune version à nettoyer.")
             return
         total_mb = sum(v.size_bytes for v in versions) / 1024 / 1024
+        # Regroupe par save_name : on prune INDÉPENDAMMENT chaque save pour
+        # éviter de supprimer la dernière version d'une save peu utilisée.
+        saves_in_repo = sorted({v.save_name for v in versions if v.save_name})
+        save_counts = {
+            s: sum(1 for v in versions if v.save_name == s) for s in saves_in_repo
+        }
+        counts_txt = " · ".join(f"{s} ({n})" for s, n in save_counts.items())
         keep = ctk.CTkInputDialog(
             text=f"Tu as {len(versions)} versions ({total_mb:.0f} MB total).\n"
-                 f"Combien veux-tu en garder (les plus récentes) ?",
+                 f"Réparties par save : {counts_txt or '(aucune nommée)'}\n\n"
+                 f"Combien en garder PAR SAVE (les plus récentes) ?",
             title="Nettoyer l'historique",
         ).get_input()
         if keep is None:
@@ -2159,11 +2508,21 @@ class App(*_AppBase):
             messagebox.showerror("Erreur", "Garde au moins 1 version.")
             return
         try:
-            deleted = repo.prune_versions(keep_last_n=n)
+            all_deleted: list[str] = []
+            # Prune indépendamment chaque save → on ne touche pas la dernière
+            # version d'une save peu utilisée.
+            for s in saves_in_repo:
+                all_deleted.extend(repo.prune_versions(keep_last_n=n, save_name=s))
+            # Versions sans save_name (anciens manifestes) : pruned globalement
+            anonymes = [v for v in versions if not v.save_name]
+            if anonymes:
+                all_deleted.extend(repo.prune_versions(keep_last_n=n))
+            new_total_mb = sum(v.size_bytes for v in repo.list_versions()) / 1024 / 1024
             messagebox.showinfo(
                 "Nettoyage",
-                f"{len(deleted)} version(s) supprimée(s).\n"
-                f"Espace libéré : ~{total_mb - sum(v.size_bytes for v in repo.list_versions()) / 1024 / 1024:.0f} MB"
+                f"{len(all_deleted)} version(s) supprimée(s).\n"
+                f"Espace libéré : ~{total_mb - new_total_mb:.0f} MB\n"
+                f"Sauvé : au moins {n} version(s) de chaque save."
             )
             self.refresh_all()
         except Exception as e:
@@ -2236,6 +2595,70 @@ class VersionPicker(ctk.CTkToplevel):
             messagebox.showerror("Erreur", "Index invalide.")
             return
         self.destroy(); self.on_pick(v)
+
+
+class BackupPicker(ctk.CTkToplevel):
+    """Liste les backups locaux et permet d'en sélectionner un à restaurer."""
+    def __init__(self, parent, backups: "list[restore_mod.BackupEntry]", on_pick):
+        super().__init__(parent)
+        self.title("Restaurer un backup")
+        self.geometry("860x500")
+        self.configure(fg_color=COLOR_BG)
+        self.on_pick = on_pick
+        self.backups = backups
+        ctk.CTkLabel(
+            self, text="↩  Choisir un backup à restaurer",
+            font=("Segoe UI", 13, "bold"), anchor="w",
+        ).pack(padx=14, pady=(14, 4), anchor="w")
+        ctk.CTkLabel(
+            self, text="Les plus récents en haut. Saisis l'index et clique Restaurer.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED, anchor="w",
+        ).pack(padx=14, pady=(0, 8), anchor="w")
+        self.listbox = ctk.CTkTextbox(
+            self, font=("Consolas", 10),
+            fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER,
+        )
+        self.listbox.pack(fill="both", expand=True, padx=14, pady=4)
+        for i, b in enumerate(backups):
+            size_mb = b.size_bytes / (1024 * 1024)
+            db_tag = "DB+" + ",".join(b.db_companions) if b.db_companions else (
+                "DB" if b.has_db else "—"
+            )
+            srv_tag = f"srv={len(b.server_files)}"
+            ok_tag = "✓" if b.restorable else "✗"
+            self.listbox.insert(
+                "end",
+                f"[{i}] {ok_tag} {b.display_timestamp}  "
+                f"[{b.save_name:<14}] {size_mb:6.1f} MB  {db_tag}  {srv_tag}\n"
+            )
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=14, pady=12)
+        ctk.CTkLabel(bar, text="Index :", font=("Segoe UI", 11)).pack(side="left")
+        self.idx_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(
+            bar, textvariable=self.idx_var, width=80, height=32,
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            bar, text="↩  Restaurer", command=self._go, height=32,
+            fg_color=ACTION_PULL, hover_color="#3690c5",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+
+    def _go(self):
+        try:
+            i = int(self.idx_var.get())
+            b = self.backups[i]
+        except (ValueError, IndexError):
+            messagebox.showerror("Erreur", "Index invalide.")
+            return
+        if not b.restorable:
+            messagebox.showerror(
+                "Erreur",
+                "Ce backup est incomplet (pas de save.zip), impossible de restaurer.",
+            )
+            return
+        self.destroy()
+        self.on_pick(b)
 
 
 class BuildWindow(ctk.CTkToplevel):

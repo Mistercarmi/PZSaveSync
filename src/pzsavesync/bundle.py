@@ -5,10 +5,14 @@ Structure du zip :
     save/                          → Zomboid/Saves/Multiplayer/<save_name>/
         ... (contenu du dossier save)
     db/<save_name>.db              → Zomboid/db/<save_name>.db
+    db/<save_name>.db-wal          → si présent (transactions SQLite non-checkpointées)
+    db/<save_name>.db-shm          → si présent
+    db/<save_name>.db-journal      → si présent
     server/
         <save_name>.ini            → Zomboid/Server/<save_name>.ini
         <save_name>_SandboxVars.lua
         <save_name>_spawnregions.lua
+        <save_name>_spawnpoints.lua → si présent (custom respawn)
 
 Le manifest porte le nom de la save d'origine, donc l'extraction restaure dans
 le BON dossier chez le destinataire même si lui n'a jamais eu cette save avant.
@@ -28,9 +32,14 @@ from typing import Callable
 
 
 MANIFEST_FILENAME = "bundle_manifest.json"
-BUNDLE_VERSION = 2  # +1 vs v1 : champ sha256 ajouté au manifest (rétro-compat à la lecture)
+BUNDLE_VERSION = 3  # v3 : ajout _spawnpoints.lua + fichiers SQLite WAL/SHM/journal
 _REQUIRED_MANIFEST_FIELDS = ("bundle_version", "save_name", "created_at", "created_by")
 _BAD_NAME_CHARS = '<>:"/\\|?*'
+
+# Suffixes SQLite compagnons d'un fichier .db (mode WAL principalement).
+# Si PZ est tué avant checkpoint, .db-wal contient les dernières transactions
+# (joueurs, vehicules, factions). Sans lui = perte de progression DB.
+_DB_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
 
 # Sécurité : limites max à l'extraction (anti zip-bomb)
 MAX_BUNDLE_SIZE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB compressé
@@ -70,22 +79,34 @@ class CompanionFiles:
     .ini / .db (souvent identique au save_name, mais peut différer si l'hôte
     a un Server name distinct du World name — cas par défaut : "servertest").
     `exact_match` = True quand le prefix == save_name.
+
+    `db_companions` : fichiers SQLite WAL/SHM/journal qui accompagnent la .db
+    quand SQLite est en mode WAL et que PZ n'a pas checkpointé. Si on les
+    laisse derrière, on perd les dernières transactions (joueurs, vehicules).
     """
     save_dir: Path | None = None
     db: Path | None = None
+    db_companions: list[Path] = field(default_factory=list)
     ini: Path | None = None
     sandbox: Path | None = None
     spawn: Path | None = None
+    spawn_points: Path | None = None
     server_prefix: str = ""
     exact_match: bool = True
 
     @property
     def server_files(self) -> list[Path]:
-        return [p for p in (self.ini, self.sandbox, self.spawn) if p is not None]
+        return [
+            p for p in (self.ini, self.sandbox, self.spawn, self.spawn_points)
+            if p is not None
+        ]
 
     @property
     def has_any_companion(self) -> bool:
-        return any(p is not None for p in (self.db, self.ini, self.sandbox, self.spawn))
+        return any(
+            p is not None
+            for p in (self.db, self.ini, self.sandbox, self.spawn, self.spawn_points)
+        )
 
 
 def _sha256_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -221,11 +242,17 @@ MTIME_INFERENCE_MAX_DELTA_SECONDS = 90 * 24 * 3600  # 90 jours
 
 @dataclass
 class _ServerSet:
-    """Un set de fichiers Server cohérents (même prefix)."""
+    """Un set de fichiers Server cohérents (même prefix).
+
+    `spawn_points` (custom respawn) est OPTIONNEL : PZ n'en génère qu'avec
+    certains mods ou un sandbox custom. Sa présence ne change pas la
+    'complétude' du set (sinon on n'aurait jamais de set complet en standard).
+    """
     prefix: str
     ini: Path
     sandbox: Path | None
     spawn: Path | None
+    spawn_points: Path | None = None
 
     @property
     def complete(self) -> bool:
@@ -237,7 +264,7 @@ class _ServerSet:
 
 
 def _scan_server_sets(server_dir: Path) -> list[_ServerSet]:
-    """Liste tous les sets Server (.ini + éventuellement _SandboxVars + _spawnregions)."""
+    """Liste tous les sets Server (.ini + éventuellement _SandboxVars + _spawnregions + _spawnpoints)."""
     if not server_dir.exists():
         return []
     sets: list[_ServerSet] = []
@@ -247,13 +274,27 @@ def _scan_server_sets(server_dir: Path) -> list[_ServerSet]:
         prefix = ini.stem
         sb = server_dir / f"{prefix}_SandboxVars.lua"
         sp = server_dir / f"{prefix}_spawnregions.lua"
+        spp = server_dir / f"{prefix}_spawnpoints.lua"
         sets.append(_ServerSet(
             prefix=prefix,
             ini=ini,
             sandbox=sb if sb.exists() else None,
             spawn=sp if sp.exists() else None,
+            spawn_points=spp if spp.exists() else None,
         ))
     return sets
+
+
+def _find_db_companions(db_path: Path) -> list[Path]:
+    """Trouve les fichiers SQLite compagnons (.db-wal, .db-shm, .db-journal) à côté d'un .db."""
+    if db_path is None or not db_path.exists():
+        return []
+    companions: list[Path] = []
+    for suffix in _DB_COMPANION_SUFFIXES:
+        comp = db_path.with_name(db_path.name + suffix)
+        if comp.exists() and comp.is_file():
+            companions.append(comp)
+    return companions
 
 
 def _pick_best_server_set(sets: list[_ServerSet], reference_mtime: float) -> _ServerSet | None:
@@ -335,6 +376,7 @@ def discover_companion_files(
     exact_db = db_dir / f"{save_name}.db"
     if exact_db.exists():
         cf.db = exact_db
+        cf.db_companions = _find_db_companions(exact_db)
     exact_ini = server_dir / f"{save_name}.ini"
     if exact_ini.exists():
         cf.ini = exact_ini
@@ -344,6 +386,9 @@ def discover_companion_files(
     exact_spawn = server_dir / f"{save_name}_spawnregions.lua"
     if exact_spawn.exists():
         cf.spawn = exact_spawn
+    exact_spawn_points = server_dir / f"{save_name}_spawnpoints.lua"
+    if exact_spawn_points.exists():
+        cf.spawn_points = exact_spawn_points
 
     if cf.db is not None or cf.ini is not None:
         return cf  # match exact partiel ou complet → on garde
@@ -367,9 +412,11 @@ def discover_companion_files(
         cf.ini = best_set.ini
         cf.sandbox = best_set.sandbox
         cf.spawn = best_set.spawn
+        cf.spawn_points = best_set.spawn_points
         cf.server_prefix = best_set.prefix
     if inferred_db is not None:
         cf.db = inferred_db
+        cf.db_companions = _find_db_companions(inferred_db)
         # Si pas de set Server trouvé, on prend le stem du .db comme prefix
         if best_set is None:
             cf.server_prefix = inferred_db.stem
@@ -389,12 +436,18 @@ def find_companions(save_name: str, root: Path | None = None) -> dict[str, Path]
         found["save_dir"] = cf.save_dir
     if cf.db is not None:
         found["db"] = cf.db
+    for comp in cf.db_companions:
+        # Clé du genre "db_wal" / "db_shm" / "db_journal" (suffix après ".db-")
+        tag = comp.name.rsplit(".db-", 1)[-1] if ".db-" in comp.name else comp.name
+        found[f"db_{tag}"] = comp
     if cf.ini is not None:
         found["server_ini"] = cf.ini
     if cf.sandbox is not None:
         found["server_SandboxVars.lua"] = cf.sandbox
     if cf.spawn is not None:
         found["server_spawnregions.lua"] = cf.spawn
+    if cf.spawn_points is not None:
+        found["server_spawnpoints.lua"] = cf.spawn_points
     return found
 
 
@@ -427,6 +480,17 @@ def build_bundle(
     # même si chez l'hôte le prefix réel est différent (ex: "servertest").
     # Côté destinataire, ça garantit que la save extraite est cohérente.
     db_target_name = f"{save_name}.db"
+    # Paires (chemin_source, nom_dans_bundle) pour les fichiers SQLite compagnons.
+    # On garde la même base de nom (renommée sous save_name) + suffixe -wal/-shm/-journal.
+    db_companion_pairs: list[tuple[Path, str]] = []
+    if cf.db is not None:
+        for comp in cf.db_companions:
+            # extension genre ".db-wal" → on garde le même suffixe sous save_name
+            for sfx in _DB_COMPANION_SUFFIXES:
+                if comp.name.endswith(".db" + sfx):
+                    db_companion_pairs.append((comp, f"{save_name}.db{sfx}"))
+                    break
+
     server_pairs: list[tuple[Path, str]] = []
     if cf.ini is not None:
         server_pairs.append((cf.ini, f"{save_name}.ini"))
@@ -434,12 +498,27 @@ def build_bundle(
         server_pairs.append((cf.sandbox, f"{save_name}_SandboxVars.lua"))
     if cf.spawn is not None:
         server_pairs.append((cf.spawn, f"{save_name}_spawnregions.lua"))
+    if cf.spawn_points is not None:
+        server_pairs.append((cf.spawn_points, f"{save_name}_spawnpoints.lua"))
 
     # Pré-scan pour avoir le total de fichiers (pour la barre de progression)
     if progress:
         progress("scan", 0, 1)
     save_files_list = [f for f in save_dir.rglob("*") if f.is_file()]
-    extra_count = (1 if cf.db else 0) + len(server_pairs)
+
+    # Sanity check : refuser de pousser une save vide.
+    # PZ écrit toujours au minimum les fichiers de chunk + metadata après
+    # une session jouée. Une save_dir sans fichier = corruption ou mauvaise
+    # sélection — un push enverrait du vide chez le pote, qui ne pourrait
+    # plus rien faire (et perdrait son propre état au pull si keep_last_n=1).
+    if not save_files_list:
+        raise ValueError(
+            f"La save '{save_name}' est vide : 0 fichier dans "
+            f"{save_dir}. Refusé pour éviter de pousser du vide chez ton pote. "
+            "Lance PZ → joue 5 minutes → re-tente le push."
+        )
+
+    extra_count = (1 if cf.db else 0) + len(db_companion_pairs) + len(server_pairs)
     total = len(save_files_list) + extra_count
     if progress:
         progress("scan", total, total)
@@ -477,6 +556,13 @@ def build_bundle(
             # DB (renommé sous {save_name}.db même si chez l'hôte c'est ex: servertest.db)
             if cf.db is not None:
                 zf.write(cf.db, f"db/{db_target_name}")
+                done += 1
+                if progress:
+                    progress("zip", done, total)
+
+            # DB SQLite companions (.db-wal / .db-shm / .db-journal)
+            for src_path, target_name in db_companion_pairs:
+                zf.write(src_path, f"db/{target_name}")
                 done += 1
                 if progress:
                     progress("zip", done, total)
@@ -599,6 +685,7 @@ def extract_bundle(
     root: Path | None = None,
     backup_dir: Path | None = None,
     verify_hash: bool = True,
+    allow_no_backup: bool = False,
 ) -> ExtractReport:
     """Extrait un bundle dans la bonne arborescence Zomboid du destinataire.
 
@@ -607,8 +694,19 @@ def extract_bundle(
     - Backup automatique des fichiers qui seraient écrasés (save_dir, db,
       fichiers server) dans backup_dir/<timestamp>/...
     - Écriture atomique de chaque fichier (tmp + rename).
+
+    SÉCURITÉ : ``backup_dir`` est OBLIGATOIRE par défaut — l'extraction écrase
+    la save_dir locale, donc sans backup on perd définitivement la progression
+    du destinataire. Pour bypass (tests, scripts éphémères), passer
+    ``allow_no_backup=True`` explicitement.
     """
     root = root or zomboid_root()
+    if backup_dir is None and not allow_no_backup:
+        raise ValueError(
+            "backup_dir est obligatoire — l'extraction écrase la save locale. "
+            "Passe un dossier de backup (ex: ~/PZSaveSync_LocalBackups) ou "
+            "allow_no_backup=True si tu sais ce que tu fais."
+        )
     manifest = read_manifest(zip_path)
     save_name = manifest.save_name
     _validate_save_name(save_name)
@@ -665,7 +763,12 @@ def extract_bundle(
             )
         if db_path.exists():
             shutil.copy2(db_path, backed_up_to / db_path.name)
-        for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
+        # Backup des compagnons SQLite (.db-wal/.db-shm/.db-journal)
+        for sfx in _DB_COMPANION_SUFFIXES:
+            comp = db_path.with_name(db_path.name + sfx)
+            if comp.exists():
+                shutil.copy2(comp, backed_up_to / comp.name)
+        for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua"):
             f = server_dir / f"{save_name}{suffix}"
             if f.exists():
                 shutil.copy2(f, backed_up_to / f.name)
@@ -676,6 +779,19 @@ def extract_bundle(
     save_dir.mkdir(parents=True, exist_ok=True)
     server_dir.mkdir(parents=True, exist_ok=True)
     (root / "db").mkdir(parents=True, exist_ok=True)
+
+    # SÉCURITÉ SQLITE : on supprime les compagnons -wal/-shm/-journal résiduels
+    # du destinataire AVANT d'extraire. Sinon, si le bundle ne contient pas de
+    # wal mais que le destinataire en a un (correspondant à son ancienne .db
+    # qu'on vient de remplacer), SQLite tenterait d'appliquer ce wal sur la
+    # nouvelle .db → corruption. Le backup ci-dessus garde une copie.
+    for sfx in _DB_COMPANION_SUFFIXES:
+        stale = db_path.with_name(db_path.name + sfx)
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     extracted_db: Path | None = None
     extracted_server: list[Path] = []
@@ -697,7 +813,9 @@ def extract_bundle(
                 fname = Path(posix).name
                 target = _safe_join(root / "db", fname)
                 _atomic_extract_file(zf, name, target)
-                extracted_db = target
+                # Le .db principal (pas un compagnon -wal/-shm/-journal)
+                if not any(fname.endswith(".db" + sfx) for sfx in _DB_COMPANION_SUFFIXES):
+                    extracted_db = target
 
             elif posix.startswith("server/"):
                 fname = Path(posix).name

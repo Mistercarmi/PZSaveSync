@@ -75,6 +75,7 @@ class Config:
     onboarding_done: bool = False
     auto_check_updates: bool = True
     last_update_check: str = ""
+    hide_help_banner: bool = False  # mémorise si l'user a fermé la bannière d'aide
 
     # ---- Accès au profil actif (compat API v0.2) ----
     @property
@@ -242,5 +243,6 @@ def save(cfg: Config) -> None:
         "onboarding_done": cfg.onboarding_done,
         "auto_check_updates": cfg.auto_check_updates,
         "last_update_check": cfg.last_update_check,
+        "hide_help_banner": cfg.hide_help_banner,
     }
     CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")

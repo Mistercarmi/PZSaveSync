@@ -88,7 +88,7 @@ def main():
     draw.text(((W - tw) / 2, 280), pitch, font=f_pitch, fill=TEXT)
 
     f_pitch_sub = _font(26)
-    sub = "sans serveur dédié · sans abonnement · open-source"
+    sub = "sans serveur dédié · sans abonnement · 100 % gratuit"
     bbox = draw.textbbox((0, 0), sub, font=f_pitch_sub)
     tw = bbox[2] - bbox[0]
     draw.text(((W - tw) / 2, 350), sub, font=f_pitch_sub, fill=TEXT_MUTED)

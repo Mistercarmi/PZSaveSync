@@ -2,11 +2,17 @@
 
 # 🎮 PZ SaveSync
 
-**Partage tes sauvegardes Project Zomboid entre potes — sans serveur dédié, sans abonnement.**
+# 💯 100 % GRATUIT · 🔍 CODE SOURCE VISIBLE · 🚫 PAS D'ABONNEMENT
+
+**Partage tes sauvegardes Project Zomboid entre potes — sans serveur dédié, sans frais cachés, sans inscription.**
 
 Juste un dossier Dropbox/Drive/OneDrive que vous avez déjà.
 
 **🇫🇷 Français** · [🇬🇧 English](README.en.md)
+
+![Free](https://img.shields.io/badge/Prix-Gratuit-2ecc71?style=for-the-badge)
+![Source Visible](https://img.shields.io/badge/Code-Source%20Visible-3498db?style=for-the-badge)
+![No Account](https://img.shields.io/badge/Compte-Aucun%20requis-9b59b6?style=for-the-badge)
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4)
@@ -17,9 +23,62 @@ Juste un dossier Dropbox/Drive/OneDrive que vous avez déjà.
 
 </div>
 
-> **N'importe qui du groupe peut héberger la prochaine session, même si l'hôte
-> habituel n'est pas là.** Un système de "tour" évite que vous écrasiez la
-> save l'un de l'autre.
+> 💸 **Pas de paywall, pas d'achat in-app, pas de pub.** Le code est public sur GitHub
+> et vérifiable — tu peux le lire, le builder toi-même, et l'utiliser indéfiniment.
+> Voir [Licence](#-licence) pour les détails (usage perso autorisé, redistribution réservée à l'auteur).
+
+---
+
+## 🎯 En 30 secondes : tu fais quoi avec cet outil ?
+
+Tu joues à PZ en multi avec tes potes. Une seule personne héberge à la fois, et il faut se passer la save quand l'hôte change. Cet outil fait **exactement deux choses** :
+
+<table width="100%">
+<tr>
+<td width="50%" valign="top">
+
+### 📥 « Je veux **récupérer** la save de mon pote pour jouer »
+
+Ton pote a fini sa session et a déposé sa save. Tu veux la récupérer pour héberger à ton tour.
+
+→ Onglet **🔄 Partager** → bouton **⬇ Récupérer la save**
+
+L'app télécharge la dernière version, sauvegarde ton état actuel au cas où, et te dit « lance PZ → Multijoueur → Héberger ». **C'est tout.**
+
+</td>
+<td width="50%" valign="top">
+
+### 📤 « Je veux **renvoyer** ma save à mes potes pour qu'ils jouent »
+
+Tu as fini ta session. Tu veux que tes potes puissent prendre la suite avec la save à jour.
+
+→ Onglet **🔄 Partager** → bouton **⬆ Envoyer ma session**
+
+L'app bundle ton monde + DB persos + config serveur, le dépose dans le dossier partagé, et ton pote n'a plus qu'à faire **Récupérer la save** chez lui. **C'est tout.**
+
+</td>
+</tr>
+</table>
+
+> 🆕 **Première utilisation ?** [Setup en 3 étapes ↓](#-installation) (pseudo, dossier partagé Dropbox/Drive/OneDrive, save active)
+
+> 🔒 **Et si on push tous les deux en même temps ?** L'app pose un **verrou de tour** : un seul à la fois peut envoyer. Personne n'écrase la save de l'autre par accident. ([détails](#anti-conflit))
+
+> 💾 **Et si je fais une bêtise ?** Avant chaque récupération, un **backup auto** de ton état actuel est créé. Tu peux le restaurer en 1 clic via **Outils → ↩ Restaurer un backup**. ([nouveau en v0.3.4](CHANGELOG.md))
+
+---
+
+## 🧠 Et techniquement, ça veut dire quoi « envoyer la save » ?
+
+PZ a besoin de 5 choses pour qu'un de tes potes puisse jouer comme s'il était l'hôte :
+
+1. **Le monde** — chunks explorés, structures construites, items posés (`Zomboid\Saves\Multiplayer\<save>\`)
+2. **La DB des persos** — chaque joueur est lié à son SteamID, donc ton pote retrouve SON perso et toi le TIEN, même si l'hôte change (`Zomboid\db\<save>.db`)
+3. **La config serveur** — mods, password admin, PVP on/off, port (`Zomboid\Server\<save>.ini`)
+4. **Les réglages sandbox** — densité de zombies, vitesse, loot... (`<save>_SandboxVars.lua`)
+5. **Les zones de spawn** — où apparaissent les nouveaux joueurs (`<save>_spawnregions.lua`, + `_spawnpoints.lua` si custom)
+
+PZ SaveSync ramasse **les 5 ensemble**, les met dans un `.zip` signé (SHA256), et garantit que ton pote les retrouve **bit-pour-bit identiques** chez lui. Tu n'as **rien** à zipper, copier, ou renommer à la main.
 
 ---
 
@@ -44,24 +103,15 @@ Juste un dossier Dropbox/Drive/OneDrive que vous avez déjà.
 
 ## 🧟 Pourquoi cet outil existe
 
-Tu joues à PZ en multi avec des potes. L'hôte habituel est en vacances. Ta
-session se termine, tu veux que ton pote prenne le relais demain. Aujourd'hui
-tu dois :
+Sans cet outil, pour passer la save entre potes tu dois :
 
-- Zipper à la main `Zomboid\Saves\Multiplayer\<server>\` + `Zomboid\db\<server>.db`
-  + `Zomboid\Server\<server>.ini` + `_SandboxVars.lua` + `_spawnregions.lua`
-- L'envoyer par WeTransfer ou Drive
+- Zipper à la main les 5 fichiers/dossiers, sans en oublier un
+- L'envoyer par WeTransfer / Drive
 - Espérer que ton pote ne se trompe pas en le rangeant chez lui
 - Croiser les doigts pour qu'aucun de vous deux n'écrase l'autre
+- Refaire ce manège à chaque changement d'hôte
 
-**PZ SaveSync automatise tout ça :**
-
-1. 🔍 **Inspecte** ta save (chunks explorés, structures, joueurs en DB)
-2. 📦 **Bundle** TOUT ce qu'il faut dans un seul `.zip` (avec un manifest)
-3. ☁ **Pousse** dans un dossier partagé Dropbox/Drive/OneDrive — ou exporte en
-   `.zip` à envoyer manuellement (Gmail, WeTransfer, Discord, USB)
-4. 🔒 Pose un **verrou** ("c'est mon tour") pour empêcher les conflits
-5. 💾 **Backup auto** avant chaque restore, au cas où
+**PZ SaveSync remplace tout ça par 2 boutons** : `⬆ Envoyer` chez toi, `⬇ Récupérer` chez ton pote. Le reste (verrou, backup, vérif d'intégrité SHA256, renommage des fichiers serveur si besoin) est automatique.
 
 ### ✨ Nouveautés v0.3
 
@@ -120,7 +170,7 @@ filer à tes potes non-devs.
 
 | | **PZ SaveSync** | [PZ-Server-Save-Manager](https://github.com/pabloherresp/PZ-Server-Save-Manager) | [SaveSync (Steam)](https://store.steampowered.com/app/3832010/SaveSync_Coop_Save_Sharing_Made_Easy/) |
 |---|---|---|---|
-| Prix | **Gratuit, open-source** | Gratuit (GPL-3) | 5,89 € |
+| Prix | **Gratuit (code source visible)** | Gratuit (GPL-3, open-source) | 5,89 € |
 | Backend | Ton Dropbox/Drive/OneDrive (déjà payé) | Local seulement | Steam Workshop (propriétaire) |
 | GUI moderne | ✅ (customtkinter) | ❌ (script Batch) | ✅ |
 | Anti-conflit (tour/lock) | ✅ | ❌ | non documenté |
@@ -132,8 +182,8 @@ filer à tes potes non-devs.
 > 💡 **Quand utiliser SaveSync (commercial) plutôt :** si tu joues aussi à
 > Stardew / Valheim / Satisfactory et que tu veux un seul outil polyvalent payant.
 >
-> 💡 **Quand utiliser PZ SaveSync :** si tu veux gratuit + open-source + ton
-> propre cloud + le mécanisme de tour pour ton groupe PZ.
+> 💡 **Quand utiliser PZ SaveSync :** si tu veux **gratuit + code vérifiable +
+> ton propre cloud** + le mécanisme de tour pour ton groupe PZ.
 
 ---
 

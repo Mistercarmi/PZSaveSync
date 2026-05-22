@@ -72,7 +72,9 @@ def test_extract_rejects_too_many_files(tmp_path):
         target = tmp_path / "target"
         target.mkdir()
         with pytest.raises(ValueError, match="suspect"):
-            bundle_mod.extract_bundle(out, root=target, verify_hash=False)
+            bundle_mod.extract_bundle(
+                out, root=target, verify_hash=False, allow_no_backup=True,
+            )
     finally:
         bundle_mod.MAX_FILES_IN_BUNDLE = original
 
@@ -94,7 +96,9 @@ def test_extract_rejects_too_large_compressed(tmp_path):
         target = tmp_path / "target"
         target.mkdir()
         with pytest.raises(ValueError, match="trop gros"):
-            bundle_mod.extract_bundle(out, root=target, verify_hash=False)
+            bundle_mod.extract_bundle(
+                out, root=target, verify_hash=False, allow_no_backup=True,
+            )
     finally:
         bundle_mod.MAX_BUNDLE_SIZE_BYTES = original
 

@@ -211,7 +211,9 @@ def test_extract_bundle_with_renamed_files_works_end_to_end(tmp_path):
 
     dest_root = tmp_path / "dest_root"
     dest_root.mkdir()
-    report = bundle_mod.extract_bundle(out, root=dest_root, verify_hash=True)
+    report = bundle_mod.extract_bundle(
+        out, root=dest_root, verify_hash=True, allow_no_backup=True,
+    )
     assert report.save_name == "MaSave"
     assert (dest_root / "Saves" / "Multiplayer" / "MaSave" / "map_0_0.bin").exists()
     assert (dest_root / "db" / "MaSave.db").exists()

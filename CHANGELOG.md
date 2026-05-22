@@ -3,6 +3,87 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.5] — 2026-05-22
+
+### Added — Garde-fous « ceinture et bretelles »
+- **Refus de pousser une save vide** : `build_bundle` vérifie maintenant que
+  la save_dir contient au moins 1 fichier avant de zipper. Avant, on pouvait
+  pousser un bundle de 0 octet de contenu monde si la save était corrompue ou
+  vidée — le pote aurait pull du vide.
+- **Clamp `keep_last_n >= 2`** : `prune_versions` garde toujours au minimum 2
+  versions par save. Sécurité contre un scénario où on push une save corrompue
+  avec `keep_last_n=1` : sans le clamp, l'ancienne version saine était
+  supprimée immédiatement → plus aucun rollback. Maintenant garanti.
+- **Health check du repo cloud** : `SharedRepo.health_check()` + bouton
+  Outils → **🩺 Vérifier le repo cloud**. Détecte les `.zip` orphelins
+  (présents mais absents du manifest, donc invisibles au pull), les entrées
+  fantômes du manifest (sans `.zip` physique), et les résidus `.tmp`. Propose
+  une réparation 1-clic : réintégration des bundles orphelins lisibles dans
+  le manifest, suppression des fantômes, nettoyage des `.tmp`.
+
+### Added — UX
+- **Bannière d'aide « 🎯 Comment ça marche en 2 clics »** en haut de l'onglet
+  Partager. Explique les 2 use cases (Récupérer / Envoyer) en 1 ligne.
+  Fermable avec ✕ (préférence persistée). Réaffichable via
+  Outils → **❓ Réafficher l'aide**.
+- **Saves non-exportables grisées** dans l'onglet Mes parties : fond plus
+  sombre, texte gris, tag `🚫 non exportable`. Plus de confusion avec les
+  saves serveur hébergées localement.
+- **Header avec version + bouton MAJ** : badge `v0.3.5` à côté du titre,
+  bouton **🆕** qui interroge GitHub Releases en 1 clic depuis n'importe quel
+  onglet. Le badge devient orange si une MAJ est disponible.
+- **Actions secondaires regroupées** sous **« ⋯ Plus d'options »** (Inspecter,
+  Diff, Inspecter version) — moins de bruit visuel dans le flux principal.
+
+### Tests
+- **+12 tests** dans `test_safety_belt_v035.py` (refus push vide, clamp
+  keep_last_n, health check repo + adopt_orphans + remove_missing_from_manifest).
+- Total : **82 tests** verts.
+
+## [0.3.4] — 2026-05-22
+
+### Fixed — Ne rien perdre, tout récupérer côté pote
+- **`_spawnpoints.lua` jamais embarqué** : si l'hôte avait configuré des
+  points de respawn custom (`<prefix>_spawnpoints.lua`), le fichier n'était
+  jamais inclus dans le bundle. Côté pote, le respawn divergait. Ajouté à la
+  découverte, au build et au backup.
+- **Fichiers SQLite WAL/SHM/journal perdus** : `db/<prefix>.db-wal`,
+  `.db-shm`, `.db-journal` ne suivaient pas la `.db` principale. Si PZ était
+  tué avant un checkpoint propre, les dernières transactions joueurs et
+  véhicules disparaissaient. Maintenant embarqués avec la `.db`, restaurés
+  ensemble, et le destinataire voit ses propres compagnons résiduels nettoyés
+  AVANT extract (sinon SQLite tenterait d'appliquer un vieux wal sur la
+  nouvelle .db → corruption).
+- **`prune_versions` global pouvait supprimer la seule version d'une autre
+  save** : l'auto-prune après push appelait `prune_versions(keep_last_n=N)`
+  sans `save_name`. Si le repo cloud contenait plusieurs saves, garder les N
+  globales pouvait sacrifier l'unique version d'une save peu utilisée. Le
+  prune est maintenant scopé à la save qu'on vient de pousser ; le prune
+  manuel itère par save (« garder N par save »).
+- **`extract_bundle(backup_dir=None)` faisait un `rmtree` sans backup** :
+  porte d'entrée pour perdre la save_dir si appelée hors GUI. Désormais
+  `backup_dir` est requis par défaut. Bypass explicite via `allow_no_backup=True`
+  (réservé aux tests).
+
+### Added
+- **Bouton « ↩ Restaurer un backup »** dans Outils. Liste les backups locaux
+  (`~/PZSaveSync_LocalBackups/pre_import_*`), affiche save/date/contenu, et
+  restaure le monde + DB + compagnons SQLite + fichiers serveur. Un backup
+  pré-restauration est créé automatiquement avant (au cas où on se trompe).
+- **Module `restore.py`** : `list_backups()`, `restore_backup()` ; idem côté
+  CLI/scripts.
+- **Bundle v3** : champs implicites (spawnpoints, db-wal/shm/journal). Rétro-
+  compatible à la lecture (les bundles v1/v2 s'ouvrent toujours).
+
+### Tests
+- **+14 tests** dans `test_recovery_completeness.py` (round-trip spawnpoints,
+  embarquage WAL/SHM, nettoyage des compagnons SQLite résiduels, refus
+  d'extract sans backup, prune scoped, restore round-trip).
+- `scripts/live_roundtrip_check.py` : script de validation à lancer en local
+  qui crée un bundle de ta vraie save, l'extrait dans un dossier fantôme,
+  et hash chaque fichier pour vérifier qu'aucune octet n'a bougé. Sans
+  toucher à la save originale.
+
 ## [0.3.3] — 2026-05-21
 
 ### Fixed

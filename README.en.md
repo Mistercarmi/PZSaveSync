@@ -2,11 +2,17 @@
 
 # 🎮 PZ SaveSync
 
-**Share your Project Zomboid saves with friends — no dedicated server, no subscription.**
+# 💯 100% FREE · 🔍 SOURCE VISIBLE · 🚫 NO SUBSCRIPTION
+
+**Share your Project Zomboid saves with friends — no dedicated server, no hidden fees, no sign-up.**
 
 Just a Dropbox/Drive/OneDrive folder you already have.
 
 [🇫🇷 Français](README.md) · **🇬🇧 English**
+
+![Free](https://img.shields.io/badge/Price-Free-2ecc71?style=for-the-badge)
+![Source Visible](https://img.shields.io/badge/Source-Visible-3498db?style=for-the-badge)
+![No Account](https://img.shields.io/badge/Account-None%20required-9b59b6?style=for-the-badge)
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4)
@@ -17,8 +23,62 @@ Just a Dropbox/Drive/OneDrive folder you already have.
 
 </div>
 
-> **Anyone in the group can host the next session, even if the regular host
-> isn't around.** A "turn" lock system prevents save overwrites.
+> 💸 **No paywall, no in-app purchase, no ads.** Source code is public on GitHub
+> and auditable — you can read it, build it yourself, and use it indefinitely.
+> See [License](#-license) for details (personal use allowed, redistribution reserved to the author).
+
+---
+
+## 🎯 In 30 seconds: what does this tool actually do?
+
+You're playing PZ co-op with friends. Only one person hosts at a time, and you need to pass the save around when the host changes. This tool does **exactly two things**:
+
+<table width="100%">
+<tr>
+<td width="50%" valign="top">
+
+### 📥 « I want to **grab** my friend's save to play »
+
+Your friend ended their session and uploaded the save. You want to grab it and host next.
+
+→ Tab **🔄 Share** → button **⬇ Pull save**
+
+The app downloads the latest version, backs up your current state just in case, and tells you "launch PZ → Multiplayer → Host". **That's it.**
+
+</td>
+<td width="50%" valign="top">
+
+### 📤 « I want to **hand off** my save to my friends »
+
+You're done playing. You want your friends to be able to keep the game running with the up-to-date save.
+
+→ Tab **🔄 Share** → button **⬆ Push my session**
+
+The app bundles your world + player DB + server config, drops it in the shared folder, and your friend just clicks **Pull save** on their end. **That's it.**
+
+</td>
+</tr>
+</table>
+
+> 🆕 **First time?** [3-step setup ↓](#-installation) (nickname, shared Dropbox/Drive/OneDrive folder, active save)
+
+> 🔒 **What if both of us push at the same time?** The app sets a **turn lock**: only one person can push at a time. Nobody overwrites the other's save by accident. ([details](#-how-it-works))
+
+> 💾 **What if I mess up?** Before every pull, an **auto-backup** of your current state is created. You can restore it in 1 click via **Tools → ↩ Restore a backup**. ([new in v0.3.4](CHANGELOG.md))
+
+---
+
+## 🧠 What does "send the save" actually mean technically?
+
+PZ needs 5 things for one of your friends to be able to play as if they were the host:
+
+1. **The world** — explored chunks, built structures, dropped items (`Zomboid\Saves\Multiplayer\<save>\`)
+2. **The player DB** — each player is linked by SteamID, so your friend finds THEIR character and you find YOURS, even when the host changes (`Zomboid\db\<save>.db`)
+3. **Server config** — mods, admin password, PVP on/off, port (`Zomboid\Server\<save>.ini`)
+4. **Sandbox settings** — zombie density, speed, loot... (`<save>_SandboxVars.lua`)
+5. **Spawn regions** — where new players appear (`<save>_spawnregions.lua`, + `_spawnpoints.lua` if custom)
+
+PZ SaveSync collects **all 5 together**, packs them into a signed `.zip` (SHA256), and guarantees your friend gets them **bit-for-bit identical** on their end. You don't have to zip, copy, or rename **anything** by hand.
 
 ---
 
@@ -43,23 +103,15 @@ Just a Dropbox/Drive/OneDrive folder you already have.
 
 ## 🧟 Why this tool exists
 
-You're playing PZ co-op with friends. The regular host is on vacation. Your
-session ends and you want your friend to take over tomorrow. Today you have to:
+Without this tool, to pass the save between friends you have to:
 
-- Zip by hand `Zomboid\Saves\Multiplayer\<server>\` + `Zomboid\db\<server>.db`
-  + `Zomboid\Server\<server>.ini` + `_SandboxVars.lua` + `_spawnregions.lua`
-- Send it via WeTransfer or Drive
+- Zip by hand all 5 files/folders, without forgetting any
+- Send via WeTransfer / Drive
 - Hope your friend doesn't misplace it
 - Cross your fingers that neither of you overwrites the other
+- Repeat this dance every time the host changes
 
-**PZ SaveSync automates all that:**
-
-1. 🔍 **Inspects** your save (explored chunks, structures, players in DB)
-2. 📦 **Bundles** EVERYTHING you need into a single `.zip` (with a manifest)
-3. ☁ **Pushes** to a shared Dropbox/Drive/OneDrive folder — or exports a
-   `.zip` to send manually (Gmail, WeTransfer, Discord, USB)
-4. 🔒 Sets a **lock** ("it's my turn") to prevent conflicts
-5. 💾 **Auto-backup** before every restore, just in case
+**PZ SaveSync replaces all that with 2 buttons**: `⬆ Push` on your end, `⬇ Pull` on your friend's end. The rest (lock, backup, SHA256 integrity check, server-file renaming if needed) is automatic.
 
 ### ✨ What's new in v0.3
 
@@ -117,7 +169,7 @@ non-dev friends.
 
 | | **PZ SaveSync** | [PZ-Server-Save-Manager](https://github.com/pabloherresp/PZ-Server-Save-Manager) | [SaveSync (Steam)](https://store.steampowered.com/app/3832010/SaveSync_Coop_Save_Sharing_Made_Easy/) |
 |---|---|---|---|
-| Price | **Free, open-source** | Free (GPL-3) | $6 |
+| Price | **Free (source visible)** | Free (GPL-3, open-source) | $6 |
 | Backend | Your Dropbox/Drive/OneDrive | Local only | Steam Workshop (proprietary) |
 | Modern GUI | ✅ (customtkinter) | ❌ (Batch script) | ✅ |
 | Anti-conflict (lock/turn) | ✅ | ❌ | not documented |

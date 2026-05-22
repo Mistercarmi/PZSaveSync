@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from pzsavesync import bundle as bundle_mod
+from pzsavesync import bundle as bundle_mod  # utilisé dans health_check/adopt_orphans
 
 VERSIONS_DIRNAME = "versions"
 LOCK_FILENAME = "lock.json"
@@ -65,6 +65,40 @@ class Version:
         }
 
 
+@dataclass
+class RepoHealth:
+    """Résultat du health_check d'un SharedRepo.
+
+    - orphan_files : .zip présents physiquement mais absents du manifest
+    - missing_files : noms dans le manifest sans .zip physique correspondant
+    - tmp_residues : fichiers .tmp / .rwm.tmp à nettoyer
+    - readable_orphans : sous-set d'orphan_files dont le manifest interne
+      est lisible → peuvent être réintégrés via adopt_orphans()
+    """
+    orphan_files: list[str]
+    missing_files: list[str]
+    tmp_residues: list[str]
+    readable_orphans: list  # list[tuple[str, BundleManifest]]
+
+    @property
+    def is_healthy(self) -> bool:
+        return not (self.orphan_files or self.missing_files or self.tmp_residues)
+
+    @property
+    def summary(self) -> str:
+        if self.is_healthy:
+            return "Repo cloud OK — aucun problème détecté."
+        bits = []
+        if self.orphan_files:
+            bits.append(f"{len(self.orphan_files)} .zip orphelin(s) (présents mais "
+                        f"absents du manifest)")
+        if self.missing_files:
+            bits.append(f"{len(self.missing_files)} entrée(s) sans .zip physique")
+        if self.tmp_residues:
+            bits.append(f"{len(self.tmp_residues)} fichier(s) .tmp résiduel(s)")
+        return "Problèmes détectés : " + " · ".join(bits)
+
+
 class SharedRepo:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -77,6 +111,115 @@ class SharedRepo:
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         if not self.manifest_path.exists():
             self._write_manifest({"versions": []})
+
+    def health_check(self) -> "RepoHealth":
+        """Vérifie l'intégrité du repo cloud :
+        - orphan_files : .zip physiquement présents mais ABSENTS du manifest
+          (peut arriver après race condition / crash entre écriture zip et
+          mise à jour du manifest). Ils sont invisibles au pull mais lisent
+          potentiellement une version saine.
+        - missing_files : entrées du manifest qui PAS de .zip physique
+          (l'archive a été supprimée à la main, ou la sync cloud a foiré).
+        - tmp_residues : .tmp / .rwm.tmp résiduels.
+        """
+        orphan_files: list[str] = []
+        missing_files: list[str] = []
+        tmp_residues: list[str] = []
+        readable_orphans: list[tuple[str, "bundle_mod.BundleManifest"]] = []
+
+        if not self.versions_dir.exists():
+            return RepoHealth(
+                orphan_files=[], missing_files=[], tmp_residues=[],
+                readable_orphans=[],
+            )
+
+        # 1. Set des filenames référencés par le manifest
+        manifest_versions = self._read_manifest().get("versions", [])
+        in_manifest = {v.get("filename") for v in manifest_versions if v.get("filename")}
+
+        # 2. Scan des fichiers physiques
+        on_disk: set[str] = set()
+        for f in self.versions_dir.iterdir():
+            if not f.is_file():
+                continue
+            if f.suffix == ".tmp" or f.name.endswith(".rwm.tmp"):
+                tmp_residues.append(f.name)
+                continue
+            if not f.name.lower().endswith(".zip"):
+                continue
+            on_disk.add(f.name)
+
+        # 3. Orphelins = sur disque mais pas dans manifest
+        for name in sorted(on_disk - in_manifest):
+            orphan_files.append(name)
+            # Essayer de lire son manifest interne pour pouvoir le réintégrer proprement
+            try:
+                m = bundle_mod.read_manifest(self.versions_dir / name)
+                readable_orphans.append((name, m))
+            except Exception:
+                # Zip illisible — on le signale mais on ne le réintègre pas
+                pass
+
+        # 4. Fantômes = dans manifest mais pas sur disque
+        for name in sorted(in_manifest - on_disk):
+            missing_files.append(name)
+
+        return RepoHealth(
+            orphan_files=orphan_files,
+            missing_files=missing_files,
+            tmp_residues=tmp_residues,
+            readable_orphans=readable_orphans,
+        )
+
+    def adopt_orphans(self, orphans: "list[tuple[str, bundle_mod.BundleManifest]]") -> int:
+        """Réintègre des bundles orphelins dans le manifest.
+
+        Pour chaque (filename, manifest) fourni, ajoute une entrée Version
+        dans le manifest du repo. Renvoie le nombre adopté.
+        """
+        if not orphans:
+            return 0
+        data = self._read_manifest()
+        versions = data.setdefault("versions", [])
+        existing_names = {v.get("filename") for v in versions}
+        adopted = 0
+        for filename, m in orphans:
+            if filename in existing_names:
+                continue
+            path = self.versions_dir / filename
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            v = Version(
+                filename=filename,
+                save_name=m.save_name,
+                uploaded_by=m.created_by,
+                uploaded_at=m.created_at,
+                size_bytes=size,
+                has_db=m.has_db,
+                server_files=list(m.server_files),
+                note=(m.note + " (réintégré)").strip(),
+            )
+            versions.append(v.to_dict())
+            adopted += 1
+        # Re-tri par date
+        versions.sort(key=lambda v: v.get("uploaded_at", ""))
+        self._write_manifest(data)
+        return adopted
+
+    def remove_missing_from_manifest(self, missing: list[str]) -> int:
+        """Supprime du manifest les entrées qui n'ont pas de .zip physique.
+        Renvoie le nombre retiré.
+        """
+        if not missing:
+            return 0
+        data = self._read_manifest()
+        kept = [v for v in data.get("versions", []) if v.get("filename") not in set(missing)]
+        removed = len(data.get("versions", [])) - len(kept)
+        data["versions"] = kept
+        self._write_manifest(data)
+        return removed
 
     def cleanup_orphan_tmp_files(self) -> list[str]:
         """Supprime les fichiers .tmp orphelins (résidus d'une opération interrompue).
@@ -205,6 +348,12 @@ class SharedRepo:
         return bundle_mod.extract_bundle(archive, backup_dir=backup_dir)
 
     # ---------- nettoyage ----------
+    # Minimum de versions à conserver côté cloud pour pouvoir rollback si
+    # un push contient une save corrompue (ex: PZ a écrit n'importe quoi
+    # avant que tu cliques). Avec N=1, tu perds la version précédente saine
+    # dès qu'une mauvaise est push. N=2 = un cran de filet.
+    MIN_KEEP_LAST_N = 2
+
     def prune_versions(
         self,
         keep_last_n: int | None = None,
@@ -213,7 +362,8 @@ class SharedRepo:
     ) -> list[str]:
         """Supprime des versions selon des critères. Renvoie la liste des fichiers supprimés.
 
-        - keep_last_n : conserve les N plus récentes (par version, du plus vieux supprimé en premier)
+        - keep_last_n : conserve les N plus récentes (par version, du plus vieux supprimé en premier).
+          **Clamp automatique à MIN_KEEP_LAST_N=2** pour garantir un rollback possible.
         - older_than_days : supprime tout ce qui est plus ancien que N jours
         - save_name : si fourni, ne touche que les versions de cette save
 
@@ -221,6 +371,11 @@ class SharedRepo:
         """
         if keep_last_n is None and older_than_days is None:
             raise ValueError("Préciser au moins keep_last_n ou older_than_days.")
+        if keep_last_n is not None and keep_last_n < self.MIN_KEEP_LAST_N:
+            # Garde-fou anti-perte : on clamp silencieusement vers le haut.
+            # Si l'user explicite veut purger à fond, il peut passer par
+            # older_than_days ou supprimer le dossier à la main.
+            keep_last_n = self.MIN_KEEP_LAST_N
 
         data = self._read_manifest()
         versions_all = data.get("versions", [])

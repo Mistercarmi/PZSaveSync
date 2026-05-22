@@ -3,6 +3,39 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.3] — 2026-05-21
+
+### Fixed
+- **Bundle vide de config serveur quand Server name ≠ World name** : si l'hôte
+  hébergeait en laissant le nom de serveur par défaut (`servertest`) tout en
+  nommant son monde autrement, le builder cherchait uniquement
+  `Server/<world>.ini` et `db/<world>.db` et n'embarquait rien. Le destinataire
+  recevait alors une save sans DB joueurs ni config, et ne voyait pas la
+  partie dans le menu Multijoueur → Héberger. Le builder utilise maintenant
+  une **stratégie en cascade** pour retrouver les bons fichiers même quand les
+  noms diffèrent :
+  1. *Set Server complet préféré* : un `.ini` accompagné de son `_SandboxVars`
+     et `_spawnregions` du même prefix bat un `.ini` orphelin.
+  2. *Corrélation mtime* entre `Saves/Multiplayer/<world>/` et les fichiers
+     de `Server/` + `db/` (PZ écrit ces trois choses simultanément à chaque
+     sauvegarde, donc les dates sont alignées à la minute près).
+  3. *Cross-vérification db ↔ server* : si on infère `prefix=X` côté Server,
+     on prend `db/X.db` directement s'il existe.
+  4. *Seuil de sécurité* : rejet de l'inférence si écart mtime > 90 jours
+     (mieux vaut un bundle sans config qu'un mauvais `.ini` embarqué).
+  Les fichiers sont embarqués dans le bundle sous `{save_name}.<ext>` pour
+  rester cohérents côté destinataire. Tracé dans le manifest via
+  `inferred_server_prefix`.
+
+## [0.3.2] — 2026-05-21
+
+### Fixed
+- **Import refusé "Bundle suspect" sur grosses saves multi** : la limite
+  `MAX_FILES_IN_BUNDLE` était à 50 000 fichiers, ce qui est dépassé par une
+  save PZ où la map a été beaucoup explorée (chaque chunk = 1 fichier
+  `chunkdata_X_Y.bin` + `map_X_Y.bin` + `zpop_X_Y.bin`). Passée à 500 000.
+  Le vrai garde-fou anti-zip-bomb reste la taille décompressée (20 GB max).
+
 ## [0.3.1] — 2026-05-21
 
 ### Fixed

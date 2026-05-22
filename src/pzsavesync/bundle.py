@@ -35,7 +35,7 @@ _BAD_NAME_CHARS = '<>:"/\\|?*'
 # Sécurité : limites max à l'extraction (anti zip-bomb)
 MAX_BUNDLE_SIZE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB compressé
 MAX_UNCOMPRESSED_SIZE_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB décompressé
-MAX_FILES_IN_BUNDLE = 50_000  # nombre max de fichiers
+MAX_FILES_IN_BUNDLE = 500_000  # nombre max de fichiers (une save PZ multi longue peut largement dépasser 50k chunks)
 
 # Callback de progression : (étape, courant, total) -> None
 # étape ∈ {"scan", "zip", "extract"} ; courant/total en octets ou en fichiers
@@ -56,9 +56,36 @@ class BundleManifest:
     mods: list[str] = field(default_factory=list)
     workshop_items: list[str] = field(default_factory=list)
     sha256: str = ""  # depuis v2 : hash du contenu (hors champ sha256 lui-même)
+    inferred_server_prefix: str = ""  # depuis v3 : prefix utilisé côté hôte si != save_name
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class CompanionFiles:
+    """Fichiers compagnons d'une save (hors save_dir).
+
+    `server_prefix` est le prefix réellement utilisé chez l'hôte pour le
+    .ini / .db (souvent identique au save_name, mais peut différer si l'hôte
+    a un Server name distinct du World name — cas par défaut : "servertest").
+    `exact_match` = True quand le prefix == save_name.
+    """
+    save_dir: Path | None = None
+    db: Path | None = None
+    ini: Path | None = None
+    sandbox: Path | None = None
+    spawn: Path | None = None
+    server_prefix: str = ""
+    exact_match: bool = True
+
+    @property
+    def server_files(self) -> list[Path]:
+        return [p for p in (self.ini, self.sandbox, self.spawn) if p is not None]
+
+    @property
+    def has_any_companion(self) -> bool:
+        return any(p is not None for p in (self.db, self.ini, self.sandbox, self.spawn))
 
 
 def _sha256_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -185,21 +212,189 @@ def parse_ini_mods(ini_path: Path) -> tuple[list[str], list[str]]:
     return mods, workshop_ids
 
 
-def find_companions(save_name: str, root: Path | None = None) -> dict[str, Path]:
-    """Retourne les chemins des fichiers compagnons existants pour une save."""
+# Seuil de confiance pour l'inférence : si l'écart de mtime entre la save_dir et
+# le candidat .ini/.db dépasse ce délai, on considère que c'est probablement pas
+# le bon fichier et on n'infère pas (mieux vaut un bundle incomplet qu'un mauvais
+# .ini embarqué qui écraserait la config chez le destinataire).
+MTIME_INFERENCE_MAX_DELTA_SECONDS = 90 * 24 * 3600  # 90 jours
+
+
+@dataclass
+class _ServerSet:
+    """Un set de fichiers Server cohérents (même prefix)."""
+    prefix: str
+    ini: Path
+    sandbox: Path | None
+    spawn: Path | None
+
+    @property
+    def complete(self) -> bool:
+        return self.sandbox is not None and self.spawn is not None
+
+    @property
+    def mtime(self) -> float:
+        return self.ini.stat().st_mtime
+
+
+def _scan_server_sets(server_dir: Path) -> list[_ServerSet]:
+    """Liste tous les sets Server (.ini + éventuellement _SandboxVars + _spawnregions)."""
+    if not server_dir.exists():
+        return []
+    sets: list[_ServerSet] = []
+    for ini in server_dir.glob("*.ini"):
+        if not ini.is_file():
+            continue
+        prefix = ini.stem
+        sb = server_dir / f"{prefix}_SandboxVars.lua"
+        sp = server_dir / f"{prefix}_spawnregions.lua"
+        sets.append(_ServerSet(
+            prefix=prefix,
+            ini=ini,
+            sandbox=sb if sb.exists() else None,
+            spawn=sp if sp.exists() else None,
+        ))
+    return sets
+
+
+def _pick_best_server_set(sets: list[_ServerSet], reference_mtime: float) -> _ServerSet | None:
+    """Choisit le set Server le plus probable pour une save.
+
+    Priorisation stricte :
+    1. S'il existe au moins un set **complet** (.ini + sandbox + spawn), on
+       choisit parmi eux celui à la mtime la plus proche de la save_dir.
+       Les sets incomplets (.ini orphelin) sont ignorés tant qu'un complet
+       est candidat.
+    2. Sinon (tous incomplets), on prend le moins mauvais en delta mtime.
+    3. Rejet si même le meilleur dépasse ``MTIME_INFERENCE_MAX_DELTA_SECONDS``.
+    """
+    if not sets:
+        return None
+    complete = [s for s in sets if s.complete]
+    pool = complete if complete else sets
+    best = min(pool, key=lambda s: abs(s.mtime - reference_mtime))
+    if abs(best.mtime - reference_mtime) > MTIME_INFERENCE_MAX_DELTA_SECONDS:
+        return None
+    return best
+
+
+def _pick_db_for_prefix(db_dir: Path, preferred_prefix: str, reference_mtime: float) -> Path | None:
+    """Trouve le .db le plus probable pour une save.
+
+    1. Si `db/{preferred_prefix}.db` existe → on le prend (cross-vérification
+       avec le Server set retenu, forte confiance).
+    2. Sinon, mtime correlation avec rejet si delta > seuil.
+    """
+    if not db_dir.exists():
+        return None
+    direct = db_dir / f"{preferred_prefix}.db"
+    if direct.exists():
+        return direct
+    candidates = [p for p in db_dir.glob("*.db") if p.is_file()]
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda p: abs(p.stat().st_mtime - reference_mtime))
+    if abs(best.stat().st_mtime - reference_mtime) > MTIME_INFERENCE_MAX_DELTA_SECONDS:
+        return None
+    return best
+
+
+def discover_companion_files(
+    save_name: str, root: Path | None = None,
+) -> CompanionFiles:
+    """Découvre les fichiers compagnons d'une save (DB, .ini, _SandboxVars, _spawnregions).
+
+    Stratégie en cascade :
+    1. **Match exact** sur ``save_name`` — cas standard, confiance totale.
+    2. **Inférence** sinon, avec deux signaux croisés :
+       a. *Set complet préféré* : un .ini accompagné de son _SandboxVars.lua ET
+          de son _spawnregions.lua du même prefix bat un .ini orphelin.
+       b. *Corrélation mtime* : PZ touche la save_dir, le .db et le .ini à chaque
+          sauvegarde, donc leurs dates de modification sont alignées à la minute
+          près. On prend le candidat avec le plus petit écart.
+       c. *Cross-vérification db ↔ server* : si on a inféré ``server_prefix=X``
+          et qu'il existe ``db/X.db``, on le prend en priorité (forte confiance).
+    3. **Seuil de sécurité** : si même le meilleur candidat est modifié il y a
+       plus de ``MTIME_INFERENCE_MAX_DELTA_SECONDS`` (90 jours) que la save_dir,
+       on refuse d'inférer — mieux vaut un bundle sans config qu'un mauvais .ini.
+
+    Couvre le cas où l'hôte a un **Server name** (par défaut "servertest") distinct
+    du **World name** = ``save_name``.
+    """
     root = root or zomboid_root()
-    found: dict[str, Path] = {}
     save_dir = root / "Saves" / "Multiplayer" / save_name
-    if save_dir.exists():
-        found["save_dir"] = save_dir
-    db = root / "db" / f"{save_name}.db"
-    if db.exists():
-        found["db"] = db
     server_dir = root / "Server"
-    for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
-        f = server_dir / f"{save_name}{suffix}"
-        if f.exists():
-            found[f"server_{suffix.lstrip('.').replace('_', '')}"] = f
+    db_dir = root / "db"
+
+    cf = CompanionFiles(
+        save_dir=save_dir if save_dir.exists() else None,
+        server_prefix=save_name,
+        exact_match=True,
+    )
+
+    # --- Match exact d'abord ---
+    exact_db = db_dir / f"{save_name}.db"
+    if exact_db.exists():
+        cf.db = exact_db
+    exact_ini = server_dir / f"{save_name}.ini"
+    if exact_ini.exists():
+        cf.ini = exact_ini
+    exact_sandbox = server_dir / f"{save_name}_SandboxVars.lua"
+    if exact_sandbox.exists():
+        cf.sandbox = exact_sandbox
+    exact_spawn = server_dir / f"{save_name}_spawnregions.lua"
+    if exact_spawn.exists():
+        cf.spawn = exact_spawn
+
+    if cf.db is not None or cf.ini is not None:
+        return cf  # match exact partiel ou complet → on garde
+
+    # --- Inférence : aucun match exact ---
+    if not save_dir.exists():
+        return cf  # rien à corréler
+    save_mtime = save_dir.stat().st_mtime
+
+    best_set = _pick_best_server_set(_scan_server_sets(server_dir), save_mtime)
+    # Pour le .db : on cherche d'abord un match avec le prefix du set Server
+    # retenu ; sinon mtime correlation pure ; sinon None.
+    preferred_prefix = best_set.prefix if best_set is not None else save_name
+    inferred_db = _pick_db_for_prefix(db_dir, preferred_prefix, save_mtime)
+
+    if best_set is None and inferred_db is None:
+        return cf  # rien d'utilisable
+
+    cf.exact_match = False
+    if best_set is not None:
+        cf.ini = best_set.ini
+        cf.sandbox = best_set.sandbox
+        cf.spawn = best_set.spawn
+        cf.server_prefix = best_set.prefix
+    if inferred_db is not None:
+        cf.db = inferred_db
+        # Si pas de set Server trouvé, on prend le stem du .db comme prefix
+        if best_set is None:
+            cf.server_prefix = inferred_db.stem
+
+    return cf
+
+
+def find_companions(save_name: str, root: Path | None = None) -> dict[str, Path]:
+    """Retourne les chemins des fichiers compagnons existants pour une save.
+
+    Wrapper rétro-compatible autour de ``discover_companion_files`` — détecte
+    aussi les fichiers Server/DB sous un prefix différent de ``save_name``.
+    """
+    cf = discover_companion_files(save_name, root)
+    found: dict[str, Path] = {}
+    if cf.save_dir is not None:
+        found["save_dir"] = cf.save_dir
+    if cf.db is not None:
+        found["db"] = cf.db
+    if cf.ini is not None:
+        found["server_ini"] = cf.ini
+    if cf.sandbox is not None:
+        found["server_SandboxVars.lua"] = cf.sandbox
+    if cf.spawn is not None:
+        found["server_spawnregions.lua"] = cf.spawn
     return found
 
 
@@ -227,19 +422,24 @@ def build_bundle(
             "Vérifie que tu as bien hébergé/joué cette partie au moins une fois."
         )
 
-    server_dir = root / "Server"
-    db_path = root / "db" / f"{save_name}.db"
-    ini_path = server_dir / f"{save_name}.ini"
+    cf = discover_companion_files(save_name, root)
+    # Les noms des fichiers dans le bundle sont TOUJOURS sous {save_name}.ext,
+    # même si chez l'hôte le prefix réel est différent (ex: "servertest").
+    # Côté destinataire, ça garantit que la save extraite est cohérente.
+    db_target_name = f"{save_name}.db"
+    server_pairs: list[tuple[Path, str]] = []
+    if cf.ini is not None:
+        server_pairs.append((cf.ini, f"{save_name}.ini"))
+    if cf.sandbox is not None:
+        server_pairs.append((cf.sandbox, f"{save_name}_SandboxVars.lua"))
+    if cf.spawn is not None:
+        server_pairs.append((cf.spawn, f"{save_name}_spawnregions.lua"))
 
     # Pré-scan pour avoir le total de fichiers (pour la barre de progression)
     if progress:
         progress("scan", 0, 1)
     save_files_list = [f for f in save_dir.rglob("*") if f.is_file()]
-    extra_count = (1 if db_path.exists() else 0) + sum(
-        1
-        for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua")
-        if (server_dir / f"{save_name}{suffix}").exists()
-    )
+    extra_count = (1 if cf.db else 0) + len(server_pairs)
     total = len(save_files_list) + extra_count
     if progress:
         progress("scan", total, total)
@@ -251,12 +451,13 @@ def build_bundle(
         created_at=dt.datetime.now().isoformat(timespec="seconds"),
         created_by=created_by,
         note=note,
-        has_db=db_path.exists(),
+        has_db=cf.db is not None,
+        inferred_server_prefix=cf.server_prefix if not cf.exact_match else "",
     )
 
     # Extraction des mods depuis le .ini (avant écriture pour les avoir dans le manifest)
-    if ini_path.exists():
-        manifest.mods, manifest.workshop_items = parse_ini_mods(ini_path)
+    if cf.ini is not None:
+        manifest.mods, manifest.workshop_items = parse_ini_mods(cf.ini)
 
     # Écriture atomique : on écrit dans .tmp puis on rename
     tmp_zip = out_zip.with_suffix(out_zip.suffix + ".tmp")
@@ -273,22 +474,20 @@ def build_bundle(
                 if progress and done % 8 == 0:
                     progress("zip", done, total)
 
-            # DB
-            if db_path.exists():
-                zf.write(db_path, f"db/{db_path.name}")
+            # DB (renommé sous {save_name}.db même si chez l'hôte c'est ex: servertest.db)
+            if cf.db is not None:
+                zf.write(cf.db, f"db/{db_target_name}")
                 done += 1
                 if progress:
                     progress("zip", done, total)
 
-            # Server config files
-            for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
-                f = server_dir / f"{save_name}{suffix}"
-                if f.exists():
-                    zf.write(f, f"server/{f.name}")
-                    manifest.server_files.append(f.name)
-                    done += 1
-                    if progress:
-                        progress("zip", done, total)
+            # Server config files (renommés sous {save_name}.<ext>)
+            for src_path, target_name in server_pairs:
+                zf.write(src_path, f"server/{target_name}")
+                manifest.server_files.append(target_name)
+                done += 1
+                if progress:
+                    progress("zip", done, total)
 
             # Manifest provisoire (sans sha256 encore — il sera ré-écrit après hash)
             zf.writestr(MANIFEST_FILENAME, json.dumps(manifest.to_dict(), indent=2))

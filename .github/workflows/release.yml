@@ -27,12 +27,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pytest
 
-      - name: Tests (pré-build)
-        run: |
-          python tests/test_roundtrip.py
-          python tests/test_security.py
+      - name: Tests (pré-build) — suite pytest complète
+        # Avant v0.3.6, on ne lançait QUE test_roundtrip + test_security en
+        # standalone. Les tests pytest-only (test_resilience_*, test_safety_belt_*,
+        # etc.) n'étaient PAS exécutés avant un release → risque de release
+        # cassée. On lance désormais toute la suite ; échec → release bloquée.
+        run: pytest tests/ -v --tb=short
 
       - name: Build .exe with PyInstaller
         run: |

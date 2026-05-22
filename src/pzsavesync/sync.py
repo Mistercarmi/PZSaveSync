@@ -221,18 +221,44 @@ class SharedRepo:
         self._write_manifest(data)
         return removed
 
-    def cleanup_orphan_tmp_files(self) -> list[str]:
+    # Âge minimal d'un .tmp pour qu'on accepte de le supprimer comme "orphelin".
+    # Si une autre instance de l'app est en plein push et a écrit son .tmp il
+    # y a 30s, on ne veut PAS le clobber. Un push réel s'étale rarement sur
+    # > 5 minutes pour un bundle de quelques GB ; au-delà, c'est très
+    # probablement un résidu d'opération crashée.
+    TMP_ORPHAN_MIN_AGE_SECONDS = 5 * 60
+
+    def cleanup_orphan_tmp_files(self, min_age_seconds: float | None = None) -> list[str]:
         """Supprime les fichiers .tmp orphelins (résidus d'une opération interrompue).
+
+        Sécurité : on ne supprime que les .tmp dont la mtime est plus vieille
+        que `min_age_seconds` (par défaut TMP_ORPHAN_MIN_AGE_SECONDS = 5 min).
+        Sans ce garde-fou, lancer une 2e instance de l'app pendant qu'une
+        autre fait un push peut clobber le .tmp en cours d'écriture →
+        l'`os.replace(tmp, target)` échouerait.
+
+        `min_age_seconds=0` permet de forcer la suppression sans délai (utile
+        pour les tests).
 
         Renvoie la liste des fichiers supprimés.
         """
         deleted: list[str] = []
         if not self.versions_dir.exists():
             return deleted
+        if min_age_seconds is None:
+            min_age_seconds = self.TMP_ORPHAN_MIN_AGE_SECONDS
+        import time as _time
+        now = _time.time()
         for f in self.versions_dir.iterdir():
             if not f.is_file():
                 continue
             if f.suffix == ".tmp" or f.name.endswith(".rwm.tmp"):
+                try:
+                    age = now - f.stat().st_mtime
+                except OSError:
+                    continue
+                if age < min_age_seconds:
+                    continue  # trop récent — peut-être un push en cours dans une autre instance
                 try:
                     f.unlink(missing_ok=True)
                     deleted.append(f.name)
@@ -308,9 +334,19 @@ class SharedRepo:
         return versions[-1] if versions else None
 
     def push_bundle(
-        self, save_name: str, uploaded_by: str, note: str = "",
+        self,
+        save_name: str,
+        uploaded_by: str,
+        note: str = "",
+        progress: bundle_mod.ProgressCb | None = None,
+        root: Path | None = None,
     ) -> Version:
-        """Crée un bundle complet (save+db+config) et le pousse dans le dossier partagé."""
+        """Crée un bundle complet (save+db+config) et le pousse dans le dossier partagé.
+
+        `progress` est transmis à `build_bundle` pour l'UI de progression.
+        `root` permet d'injecter une racine Zomboid alternative (tests, $PZ_ZOMBOID_ROOT
+        est honoré par défaut côté bundle).
+        """
         self.init_if_needed()
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         safe_user = "".join(c for c in uploaded_by if c.isalnum() or c in "-_") or "anon"
@@ -323,6 +359,8 @@ class SharedRepo:
             out_zip=target,
             created_by=uploaded_by,
             note=note,
+            root=root,
+            progress=progress,
         )
 
         version = Version(
@@ -438,6 +476,24 @@ class SharedRepo:
 
     # ---------- manifest ----------
     def _read_manifest(self) -> dict:
+        """Lit le manifest du repo. Tolérant aux corruptions.
+
+        Si manifest.json est tronqué (sync cloud foireuse, crash en écriture)
+        ou édité à la main de manière incohérente, on log et on renvoie un
+        manifest vide plutôt que de crasher l'UI. Les .zip physiques restent
+        sur disque — `health_check()` les redétectera comme orphelins et
+        proposera une réintégration.
+        """
         if not self.manifest_path.exists():
             return {"versions": []}
-        return json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[sync] manifest.json illisible : {e} — fallback vide", file=sys.stderr)
+            return {"versions": []}
+        if not isinstance(data, dict):
+            print("[sync] manifest.json invalide (pas un objet) — fallback vide", file=sys.stderr)
+            return {"versions": []}
+        if not isinstance(data.get("versions"), list):
+            data["versions"] = []
+        return data

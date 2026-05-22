@@ -5,7 +5,6 @@ Apparaît si la config est vierge (player_name vide OU onboarding_done=False).
 """
 from __future__ import annotations
 
-from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -22,6 +21,7 @@ COLOR_TEXT = "#e6e8ec"
 COLOR_TEXT_MUTED = "#8a8e97"
 COLOR_TEXT_DIM = "#5a5e66"
 COLOR_OK = "#4caf6d"
+COLOR_BAD = "#d65a5a"
 COLOR_STAR = "#f5c842"
 ACTION_PRIMARY = "#2c7fb8"
 ACTION_SUCCESS = "#2e8b57"
@@ -162,6 +162,15 @@ class OnboardingWizard(ctk.CTkToplevel):
         entry.pack(fill="x", padx=20, pady=4)
         entry.focus_set()
 
+        # Message d'erreur (caché par défaut) — affiché si l'user clique
+        # « Suivant » avec un pseudo vide. Avant, le bouton ne faisait rien
+        # silencieusement, ce qui laissait l'user perplexe.
+        self.name_error = ctk.CTkLabel(
+            self.body, text="", anchor="w",
+            font=("Segoe UI", 10), text_color=COLOR_BAD,
+        )
+        self.name_error.pack(fill="x", padx=20, pady=(4, 0))
+
     # -------------- step 2 : dossier --------------
     def _render_step_folder(self):
         ctk.CTkLabel(
@@ -270,7 +279,12 @@ class OnboardingWizard(ctk.CTkToplevel):
         if self.step == 0:
             name = self.name_var.get().strip()
             if not name:
-                return  # ne pas avancer si vide
+                # Feedback explicite plutôt que de ne rien faire (UX confuse).
+                if hasattr(self, "name_error"):
+                    self.name_error.configure(
+                        text="⚠  Saisis un pseudo pour continuer."
+                    )
+                return
             self.cfg.player_name = name
         elif self.step == 1:
             self.cfg.shared_folder = self.folder_var.get().strip()

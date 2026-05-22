@@ -18,7 +18,14 @@ from pathlib import Path
 
 from pzsavesync import bundle as bundle_mod
 
-_BACKUP_NAME_RX = re.compile(r"^pre_import_(?P<save>.+)_(?P<ts>\d{8}-\d{6})$")
+# Reconnaît deux préfixes :
+#  - `pre_import_` : backup auto créé avant un pull/import (extract_bundle)
+#  - `pre_restore_` : backup auto créé avant une restauration (restore_backup)
+# Sans ça, un user qui restaure le mauvais backup ne voyait pas le filet de
+# secours créé juste avant — il faut pouvoir revenir en arrière en 1 clic.
+_BACKUP_NAME_RX = re.compile(
+    r"^pre_(?P<kind>import|restore)_(?P<save>.+)_(?P<ts>\d{8}-\d{6})$"
+)
 
 
 @dataclass
@@ -26,6 +33,7 @@ class BackupEntry:
     path: Path
     save_name: str
     timestamp: str  # YYYYMMDD-HHMMSS
+    kind: str = "import"  # "import" (avant pull/import) | "restore" (avant restauration)
     size_bytes: int = 0
     has_save_zip: bool = False
     has_db: bool = False
@@ -46,6 +54,10 @@ class BackupEntry:
         """Au minimum un save.zip → on peut restaurer la save_dir."""
         return self.has_save_zip
 
+    @property
+    def kind_label(self) -> str:
+        return "avant import" if self.kind == "import" else "avant restauration"
+
 
 def list_backups(backup_root: Path) -> list[BackupEntry]:
     """Liste les backups disponibles, triés du plus récent au plus ancien."""
@@ -62,6 +74,7 @@ def list_backups(backup_root: Path) -> list[BackupEntry]:
             path=entry,
             save_name=m.group("save"),
             timestamp=m.group("ts"),
+            kind=m.group("kind"),
         )
         size = 0
         for f in entry.rglob("*"):

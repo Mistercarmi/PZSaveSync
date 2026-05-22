@@ -29,19 +29,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Roundtrip integration test
-        run: python tests/test_roundtrip.py
-
-      - name: Security test
-        run: python tests/test_security.py
+      - name: Install pytest
+        run: pip install pytest
 
       - name: Unit tests (pytest)
-        run: |
-          pip install pytest
-          # On lance pytest sur le dossier tests/, et on accepte qu'il
-          # ne trouve aucun test compatible (mode tolerant pour ce job)
-          pytest tests/ -v --tb=short || echo "pytest a renvoyé un code différent de 0"
+        # Lance toute la suite. Couvre déjà test_roundtrip et test_security
+        # via la découverte pytest standard — pas besoin de les rappeler à la main.
+        # ATTENTION : NE PAS ajouter `|| true` ou `|| echo ...` ici, sinon les
+        # échecs de tests passent silencieusement et la CI ne sert plus à rien
+        # (bug constaté pré-v0.3.6).
+        run: pytest tests/ -v --tb=short
 
       - name: Compile-check all modules
-        run: |
-          python -m compileall -q src/pzsavesync
+        run: python -m compileall -q src/pzsavesync

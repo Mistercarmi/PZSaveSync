@@ -8,13 +8,37 @@ from __future__ import annotations
 import platform
 import subprocess
 import sys
+from xml.sax.saxutils import escape as _xml_escape
+
+
+def _ps_safe_xml(s: str) -> str:
+    """Prépare une string pour être interpolée dans un litéral PowerShell
+    single-quoted PUIS chargée par LoadXml().
+
+    Deux niveaux d'échappement :
+    1. XML : `&`, `<`, `>`, `"`, `'` (saxutils.escape gère les 3 premiers,
+       on ajoute manuellement les quotes pour LoadXml strict).
+    2. PowerShell single-quoted : doubler les `'` (devient `''` dans la
+       string PS), s'applique APRÈS le XML escape pour ne pas casser
+       les `&apos;` produits par l'étape 1.
+
+    Avant ce fix, un title contenant `Marathon & Z` cassait le XML et le
+    toast ne s'affichait pas. Limité en pratique parce que les noms de
+    save sont validés, mais defense en profondeur pour les notes / messages.
+    """
+    # Étape 1 : XML escape complet (entities pour " et ' aussi)
+    escaped = _xml_escape(s, {'"': "&quot;", "'": "&apos;"})
+    # Étape 2 : Les `&apos;` ne contiennent plus de `'` brut, donc
+    # le doublage des `'` PS ne touche pas ces entities. Mais l'input
+    # original pouvait contenir des `'` qui sont devenus `&apos;` → safe.
+    # Si jamais d'autres `'` restaient (paranoïa), on les doublerait ici.
+    return escaped
 
 
 def _windows_toast(title: str, message: str) -> bool:
     """Toast Windows 10/11 via PowerShell + WinRT (sans dépendance externe)."""
-    # Échappement minimal : on remplace " et ' par leur version sûre
-    safe_title = title.replace("'", "''")
-    safe_msg = message.replace("'", "''")
+    safe_title = _ps_safe_xml(title)
+    safe_msg = _ps_safe_xml(message)
     ps = (
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
         "ContentType=WindowsRuntime] | Out-Null;"

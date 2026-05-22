@@ -6,11 +6,14 @@ Si l'URL est vide ou invalide, les fonctions retournent silencieusement False.
 from __future__ import annotations
 
 import json
-import sys
 import urllib.error
 import urllib.request
 from typing import Any
 
+
+# User-Agent unique : on n'importe pas APP_VERSION depuis gui.py pour éviter
+# un cycle d'import (gui → discord_webhook). On synchronise manuellement.
+USER_AGENT = "PZSaveSync/0.3.6"
 
 PZ_COLOR_GREEN = 0x2e8b57   # même teinte que notre action "push" dans la GUI
 PZ_COLOR_BLUE = 0x2c7fb8
@@ -37,7 +40,7 @@ def post(url: str, payload: dict[str, Any], timeout: float = 5.0) -> tuple[bool,
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "PZSaveSync/0.2"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             code = resp.status

@@ -86,7 +86,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 
 
 _AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)
@@ -1678,34 +1678,12 @@ class App(*_AppBase):
         dlg = ProgressDialog(self, "Push en cours…")
 
         def worker(progress_cb):
-            ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-            safe_user = "".join(c for c in name if c.isalnum() or c in "-_") or "anon"
-            safe_save = "".join(c for c in save_name if c.isalnum() or c in "-_") or "save"
-            filename = f"bundle_{safe_save}_{ts}_{safe_user}.zip"
-            target = repo.versions_dir / filename
-            m = bundle_mod.build_bundle(
+            return repo.push_bundle(
                 save_name=save_name,
-                out_zip=target,
-                created_by=name,
+                uploaded_by=name,
                 note=note,
                 progress=progress_cb,
             )
-            # Enregistrer la version dans le manifest du repo
-            from pzsavesync.sync import Version as _V
-            v = _V(
-                filename=filename,
-                save_name=save_name,
-                uploaded_by=name,
-                uploaded_at=m.created_at,
-                size_bytes=target.stat().st_size,
-                has_db=m.has_db,
-                server_files=m.server_files,
-                note=note,
-            )
-            data = repo._read_manifest()
-            data.setdefault("versions", []).append(v.to_dict())
-            repo._write_manifest(data)
-            return v
 
         def on_done(v, err):
             if err:
@@ -1839,7 +1817,12 @@ class App(*_AppBase):
         if not repo: return
         if not messagebox.askyesno("Forcer", "Forcer la libération du verrou ?"):
             return
-        repo.release_lock(holder="*", force=True); self.refresh_all()
+        # On utilise le pseudo de l'user pour tracer qui a forcé (utile dans
+        # les logs / un futur webhook). Le `force=True` bypasse la vérif holder.
+        holder = self.cfg.player_name or "*"
+        repo.release_lock(holder=holder, force=True)
+        _log.info("Force-release du verrou par %s", holder)
+        self.refresh_all()
 
     def _push(self):
         save = self.cfg.save_name
@@ -1913,7 +1896,7 @@ class App(*_AppBase):
         self.preview_box.insert("end", "Calcul du diff...\n")
         self.update_idletasks()
         try:
-            save_path = Path.home() / "Zomboid" / "Saves" / "Multiplayer" / latest.save_name
+            save_path = bundle_mod.zomboid_root() / "Saves" / "Multiplayer" / latest.save_name
             local = inspector.inspect_save(save_path)
             remote = inspector.inspect_zip(repo.versions_dir / latest.filename)
             text = inspector.format_info(local, "── Local ──") + "\n\n"
@@ -2402,6 +2385,11 @@ class App(*_AppBase):
         """Renvoie un message si la save locale active est plus vieille que le latest cloud.
 
         Renvoie None sinon.
+
+        Perf : on ré-utilise `info.last_played` calculé par `inspect_save`
+        pendant le `list_all_with_info()` du refresh courant — avant
+        v0.3.6, on rglobait la save_dir une 2e fois (~secondes de freeze UI
+        sur les saves de 50k+ chunks).
         """
         if not self.cfg.save_name or not self.cfg.shared_folder:
             return None
@@ -2412,17 +2400,16 @@ class App(*_AppBase):
             return None
         if not latest or latest.save_name != self.cfg.save_name:
             return None
-        # Local save mtime
-        local_save = Path.home() / "Zomboid" / "Saves" / "Multiplayer" / self.cfg.save_name
-        if not local_save.exists():
+        # Cherche la save active dans le scan déjà fait par refresh_all
+        active_entry = next(
+            (e for e in self._save_entries if e.name == self.cfg.save_name), None,
+        )
+        if active_entry is None or not active_entry.info.last_played:
             return None
         try:
-            local_mtime = max(
-                f.stat().st_mtime for f in local_save.rglob("*") if f.is_file()
-            )
-        except (ValueError, OSError):
+            local_dt = dt.datetime.fromisoformat(active_entry.info.last_played)
+        except (ValueError, TypeError):
             return None
-        local_dt = dt.datetime.fromtimestamp(local_mtime)
         try:
             remote_dt = dt.datetime.fromisoformat(latest.uploaded_at)
         except (ValueError, TypeError):
@@ -2626,9 +2613,11 @@ class BackupPicker(ctk.CTkToplevel):
             )
             srv_tag = f"srv={len(b.server_files)}"
             ok_tag = "✓" if b.restorable else "✗"
+            # tag visuel du type de backup pour distinguer pre_import vs pre_restore
+            kind_tag = "📥" if b.kind == "import" else "↩"
             self.listbox.insert(
                 "end",
-                f"[{i}] {ok_tag} {b.display_timestamp}  "
+                f"[{i}] {ok_tag} {kind_tag} {b.display_timestamp}  "
                 f"[{b.save_name:<14}] {size_mb:6.1f} MB  {db_tag}  {srv_tag}\n"
             )
         bar = ctk.CTkFrame(self, fg_color="transparent")

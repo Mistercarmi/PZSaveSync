@@ -79,7 +79,8 @@ def test_cleanup_orphan_tmp(tmp_path):
     (repo.versions_dir / "bundle_a.zip.tmp").write_bytes(b"residue")
     (repo.versions_dir / "bundle_b.zip").write_bytes(b"ok")
     (repo.versions_dir / "bundle_c.zip.rwm.tmp").write_bytes(b"residue2")
-    deleted = repo.cleanup_orphan_tmp_files()
+    # min_age_seconds=0 pour bypasser le garde-fou anti-concurrence (cf v0.3.6)
+    deleted = repo.cleanup_orphan_tmp_files(min_age_seconds=0)
     assert "bundle_a.zip.tmp" in deleted
     assert "bundle_c.zip.rwm.tmp" in deleted
     assert "bundle_b.zip" not in deleted

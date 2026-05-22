@@ -24,7 +24,6 @@ import hashlib
 import json
 import os
 import shutil
-import tempfile
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -212,13 +211,17 @@ def parse_ini_mods(ini_path: Path) -> tuple[list[str], list[str]]:
     Retourne (mods, workshop_ids). Tolérant aux erreurs : retourne des listes
     vides si le fichier n'existe pas ou ne peut pas être lu.
 
+    Encoding : `utf-8-sig` strip automatiquement le BOM UTF-8 (`\\ufeff`)
+    que Notepad ajoute parfois. Sans ça, la 1ʳᵉ ligne devient
+    `\\ufeffMods=...` et `startswith("Mods=")` rate → aucun mod détecté.
+
     Workshop IDs : doivent être strictement numériques (filtre les valeurs
     bidons / tentatives d'injection).
     """
     mods: list[str] = []
     workshop_ids: list[str] = []
     try:
-        text = ini_path.read_text(encoding="utf-8", errors="ignore")
+        text = ini_path.read_text(encoding="utf-8-sig", errors="ignore")
     except (OSError, FileNotFoundError):
         return mods, workshop_ids
     for line in text.splitlines():

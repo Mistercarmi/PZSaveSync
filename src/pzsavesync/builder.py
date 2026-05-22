@@ -48,6 +48,10 @@ def build(log: Callable[[str], None], on_done: Callable[[bool, Path | None], Non
                 "--name", "PZSaveSync",
                 "--paths", str(ROOT / "src"),
                 "--collect-all", "customtkinter",
+                # tkinterdnd2 = drag-and-drop. Doit être collecté pour que
+                # le .exe ait la feature (le code Python a un fallback mais
+                # PyInstaller ne le packagerait pas autrement).
+                "--collect-all", "tkinterdnd2",
                 str(ENTRY),
             ]
             log("Commande : " + " ".join(cmd))

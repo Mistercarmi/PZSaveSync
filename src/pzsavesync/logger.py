@@ -1,7 +1,8 @@
 """Logger persistant : tous les events de l'app sont écrits dans un fichier rotatif.
 
-Fichier : %APPDATA%/PZSaveSync/logs/pzsavesync-YYYY-MM-DD.log
-Rétention : 14 jours (purge auto au démarrage).
+Fichier : %APPDATA%/PZSaveSync/logs/pzsavesync.log
+Rotation : à minuit, suffixé par YYYY-MM-DD (TimedRotatingFileHandler).
+Rétention : 14 jours (purge auto au démarrage + backupCount du handler).
 """
 from __future__ import annotations
 
@@ -22,7 +23,11 @@ def _logs_dir() -> Path:
 
 
 LOGS_DIR = _logs_dir()
-LOG_FILE = LOGS_DIR / f"pzsavesync-{dt.date.today().isoformat()}.log"
+# Le fichier "courant" sans date. Le TimedRotatingFileHandler rotationnera
+# automatiquement vers `pzsavesync.log.YYYY-MM-DD` à minuit, peu importe la
+# durée d'exécution de l'app. Avant on figeait la date à l'import, donc une
+# session ouverte sur 2 jours écrivait toute la nuit dans le fichier de la veille.
+LOG_FILE = LOGS_DIR / "pzsavesync.log"
 
 
 _configured = False
@@ -42,9 +47,18 @@ def setup() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Handler fichier — rotation manuelle par date du jour
+    # Handler fichier — rotation à minuit, suffixe = date.
+    # backupCount=14 → retient 14 fichiers historiques (= 14 jours).
     try:
-        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        fh = logging.handlers.TimedRotatingFileHandler(
+            LOG_FILE,
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+            utc=False,
+        )
+        fh.suffix = "%Y-%m-%d"
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -77,19 +91,25 @@ def get(name: str = "pzsavesync") -> logging.Logger:
 
 
 def purge_old(days: int = 14) -> int:
-    """Supprime les fichiers de log plus vieux que `days` jours. Renvoie le nombre supprimé."""
+    """Supprime les fichiers de log plus vieux que `days` jours. Renvoie le nombre supprimé.
+
+    Couvre l'ANCIEN format `pzsavesync-YYYY-MM-DD.log` (avant TimedRotating)
+    et le NOUVEAU format `pzsavesync.log.YYYY-MM-DD` (avec rotation).
+    """
     if not LOGS_DIR.exists():
         return 0
     cutoff = dt.datetime.now() - dt.timedelta(days=days)
     deleted = 0
-    for f in LOGS_DIR.glob("pzsavesync-*.log"):
-        try:
-            mtime = dt.datetime.fromtimestamp(f.stat().st_mtime)
-            if mtime < cutoff:
-                f.unlink(missing_ok=True)
-                deleted += 1
-        except OSError:
-            continue
+    patterns = ("pzsavesync-*.log", "pzsavesync.log.*")
+    for pattern in patterns:
+        for f in LOGS_DIR.glob(pattern):
+            try:
+                mtime = dt.datetime.fromtimestamp(f.stat().st_mtime)
+                if mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError:
+                continue
     return deleted
 
 

@@ -3,6 +3,135 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.6] — 2026-05-22
+
+### Fixed — parsing INI cassé sur BOM UTF-8 (audit phase 3)
+
+- **`parse_ini_mods` ratait les mods quand le `.ini` avait un BOM UTF-8** :
+  un user qui éditait son server.ini avec Notepad Windows (et le sauvegardait
+  en « UTF-8 with BOM ») finissait avec un `\\ufeff` en début de fichier.
+  La 1re ligne devenait `\\ufeffMods=...` et `startswith("Mods=")` ratait
+  → 0 mod détecté dans le bundle, **le pote recevait une save sans mods**.
+  Fix : `encoding="utf-8-sig"` qui consomme le BOM automatiquement.
+
+### Improved — perf refresh_all (audit phase 3)
+
+- **`_check_save_late` ne re-rglob plus la save** : avant, `refresh_all`
+  appelait `list_all_with_info()` qui scanne chaque save_dir, PUIS
+  `_check_save_late` rglobait la save active une 2e fois pour calculer
+  son mtime. Sur une save de 50k chunks, ça doublait le freeze UI à
+  chaque refresh. Maintenant on ré-utilise `info.last_played` du scan
+  initial.
+
+### Fixed — CI cassée silencieusement (audit phase 2)
+
+- **`tests.yml` ne masquait plus les échecs pytest** : la step pytest avait
+  `pytest tests/ -v --tb=short || echo "pytest a renvoyé un code différent de 0"`
+  → un test qui plante laissait la CI **verte**. La suite pouvait être
+  intégralement rouge depuis des semaines sans qu'on le voie. Fix : retiré
+  le `|| echo`, commentaire explicite pour ne plus le rajouter par réflexe.
+- **`release.yml` ne lançait que 2 tests sur la suite complète** : on faisait
+  `python tests/test_roundtrip.py` + `python tests/test_security.py` en
+  standalone. Tous les tests ajoutés à pytest (`test_resilience_v036`,
+  `test_safety_belt_v035`, `test_recovery_completeness`, etc.) **n'étaient
+  pas exécutés avant la build du `.exe`**. Une release pouvait donc shipper
+  alors que ~70% de la suite était rouge. Fix : `pytest tests/ -v` en pré-build.
+
+### Fixed — UX silencieuse (audit phase 2)
+
+- **`ProgressDialog.run_in_thread` n'appelait plus `on_done` si l'user fermait
+  la dialog en cours d'opération** : `self.after(0, finalize)` levait
+  `TclError` (widget destroyed), le `try/except` swallowait, et le messagebox
+  de succès/échec ne s'affichait jamais. Sur un push long, l'user fermait la
+  fenêtre par accident et n'avait plus aucune confirmation. Fix : cascade de
+  fallbacks (`self.after` → `master.after` → appel synchrone) pour garantir
+  que `on_done` s'exécute toujours.
+- **Notifications PowerShell : XML escape des caractères spéciaux** :
+  `&`, `<`, `>`, `"`, `'` dans le title ou message brisaient le `LoadXml()`
+  du toast → notification silencieusement absente. En pratique limité (les
+  noms de saves sont validés), mais defense en profondeur pour les notes
+  utilisateur et messages futurs. Fix via `xml.sax.saxutils.escape` étendu
+  aux quotes.
+
+### Tests
+- **+17 tests** dans `test_notifications.py` (échappement XML) et
+  `test_progress_dialog_resilience.py` (cascade de fallbacks on_done).
+- **+25 tests** dans `test_coverage_gaps.py` :
+  - `parse_ini_mods` avec BOM UTF-8, CRLF, CR-only, edge cases
+  - `SharedRepo.push_bundle` complet (jamais testé jusqu'ici malgré son
+    rôle central — gui.py dupliquait sa logique inline avant v0.3.6)
+  - `SharedRepo.pull_bundle` (jamais testé)
+  - **Verrou de tour** (`take_lock` / `release_lock` / `get_lock`) — feature
+    centrale du workflow cloud qui n'avait AUCUN test : prise normale,
+    refus si autre holder, force=True, libération, résilience à un
+    lock.json corrompu / incomplet / array
+- Couverture sync.py : **73% → 89%**
+- Couverture totale : **71% → 74%**
+- Total : **140 tests** verts (115 → 140).
+
+### Fixed — résilience et défense en profondeur (audit complet)
+
+- **`config.save()` désormais ATOMIQUE** : avant, un crash ou coupure de
+  courant pendant l'écriture pouvait tronquer `config.json` → `load()`
+  retombait sur une `Config()` vide → l'user **perdait ses profils, pseudo,
+  dossier partagé et webhook**. Maintenant écriture via `.tmp` + `os.replace`,
+  comme partout ailleurs dans le code.
+- **`SharedRepo._read_manifest()` tolère un manifest corrompu** : si
+  `versions/manifest.json` est tronqué (sync cloud foireuse, édit manuel),
+  on log et on renvoie un manifest vide au lieu de crasher l'UI au
+  `_refresh_cloud`. Les `.zip` physiques restent sur disque et
+  `health_check()` les redétecte comme orphelins → réintégration 1-clic.
+- **`inspector.inspect_zip()` n'extrait plus l'archive entière** : avant,
+  cliquer « Inspecter un .zip » sur un bundle de 500 MB extrayait tout
+  dans `/tmp` (lent + risque zip-bomb / zip-slip sur Python < 3.12).
+  Maintenant on lit uniquement le manifest et la DB (si présente) via
+  `zf.open()` ciblé, avec garde-fous anti zip-bomb (500 000 fichiers,
+  20 GB décompressé, 200 MB max pour la DB embarquée).
+- **PyInstaller `.exe` embarque tkinterdnd2** : avant, le `.spec` et le
+  builder ne faisaient `collect_all` que sur `customtkinter`. Résultat :
+  le drag-and-drop documenté dans le CHANGELOG v0.3.0 était silencieusement
+  absent du `.exe` distribué (fallback `_DND_AVAILABLE=False` invisible
+  pour l'utilisateur). Fix : ajouté à `PZSaveSync.spec` et `builder.py`.
+
+### Fixed — bugs mineurs déterrés par l'audit
+
+- **`cleanup_orphan_tmp_files` ne clobber plus un push concurrent** :
+  ajoute un délai minimal de 5 minutes avant de considérer un `.tmp` comme
+  orphelin. Sans ça, lancer une 2ᵉ instance pendant qu'une 1ʳᵉ pushe
+  pouvait supprimer son `.tmp` actif → `os.replace` échouait.
+- **GUI : Diff et bannière "save en retard" honorent `$PZ_ZOMBOID_ROOT`** :
+  deux endroits utilisaient `Path.home() / "Zomboid"` en dur, ignorant
+  l'override d'environnement (`bundle.py`, `saves.py`, etc. le respectent
+  déjà). Sur Linux/Mac, ces fonctionnalités pointaient au mauvais endroit.
+- **Logger : rotation par date via `TimedRotatingFileHandler`** : avant,
+  `LOG_FILE` était figé à l'import → une session ouverte sur 2 jours
+  écrivait toute la nuit dans le fichier de la veille. `purge_old` couvre
+  désormais les deux formats (ancien `pzsavesync-DATE.log` et nouveau
+  `pzsavesync.log.DATE`).
+- **`_force_release` du verrou trace le pseudo** : avant `holder="*"` en
+  dur, maintenant `holder=cfg.player_name` + log INFO.
+- **`restore.list_backups()` voit les `pre_restore_*`** : un user qui se
+  trompe de backup à restaurer voit maintenant le filet de secours créé
+  juste avant. Tag visuel 📥 vs ↩ dans le picker.
+- **`onboarding` : feedback explicite sur pseudo vide** : avant, le bouton
+  "Suivant" ne faisait rien silencieusement. Maintenant un message rouge
+  guide l'utilisateur.
+- **`_do_push` ne duplique plus la logique de `push_bundle`** : le worker
+  inline réimplémentait `SharedRepo.push_bundle` pour passer un
+  `progress_cb`. `push_bundle` accepte maintenant `progress=...`.
+
+### Tests
+- **+16 tests** dans `test_resilience_v036.py` couvrant : atomicité de
+  `config.save`, tolérance de `_read_manifest`, sécurité d'`inspect_zip`
+  (no extractall, anti zip-bomb, bad zip), délai anti-concurrence de
+  `cleanup_orphan_tmp_files`, visibilité des `pre_restore_*`.
+- Total : **98 tests** verts.
+
+### Cleanup
+- Imports inutilisés retirés : `tempfile` dans `bundle.py`, `sys` dans
+  `discord_webhook.py`, `Path` dans `onboarding.py`.
+- User-Agent webhook Discord aligné sur la version courante (`PZSaveSync/0.3.6`).
+
 ## [0.3.5] — 2026-05-22
 
 ### Added — Garde-fous « ceinture et bretelles »

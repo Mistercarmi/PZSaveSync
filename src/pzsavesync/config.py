@@ -233,6 +233,13 @@ def load() -> Config:
 
 
 def save(cfg: Config) -> None:
+    """Sérialise la config sur disque en ÉCRITURE ATOMIQUE.
+
+    Écrit dans `config.json.tmp` puis `os.replace()`. Sans ça, un crash ou
+    coupure de courant pendant l'écriture laisserait un `config.json` tronqué
+    et `load()` retomberait sur une Config() vide → l'user perdrait ses
+    profils, son pseudo, son dossier partagé et son webhook.
+    """
     APP_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "active_profile": cfg.active_profile,
@@ -245,4 +252,14 @@ def save(cfg: Config) -> None:
         "last_update_check": cfg.last_update_check,
         "hide_help_banner": cfg.hide_help_banner,
     }
-    CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    payload = json.dumps(data, indent=2)
+    tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

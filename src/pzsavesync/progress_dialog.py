@@ -103,7 +103,13 @@ class ProgressDialog(ctk.CTkToplevel):
         worker: Callable,
         on_done: Callable | None = None,
     ):
-        """Lance `worker(progress_cb)` dans un thread. À la fin, appelle on_done(result, err)."""
+        """Lance `worker(progress_cb)` dans un thread. À la fin, appelle on_done(result, err).
+
+        on_done est appelée MÊME si la dialog a été fermée pendant l'opération
+        (Alt+F4, croix). Sans ça, un user qui ferme la dialog pendant un push
+        long ne savait jamais si ça a marché — le bundle pouvait être sur le
+        cloud sans aucune confirmation visible.
+        """
         def thread_target():
             err = None
             result = None
@@ -111,16 +117,42 @@ class ProgressDialog(ctk.CTkToplevel):
                 result = worker(self._set_progress_safe)
             except Exception as e:
                 err = e
-            finally:
-                def finalize():
-                    try:
-                        self.destroy()
-                    except Exception:
-                        pass
-                    if on_done:
-                        on_done(result, err)
+
+            def finalize():
+                # destroy() peut throw si déjà détruite par l'user → on swallow
                 try:
-                    self.after(0, finalize)
+                    self.destroy()
+                except Exception:
+                    pass
+                if on_done:
+                    on_done(result, err)
+
+            # On essaie d'abord de marshaler sur le main thread via after(0, ...)
+            # — chemin nominal quand la dialog est encore vivante.
+            try:
+                self.after(0, finalize)
+                return
+            except Exception:
+                pass
+
+            # Fallback : dialog détruite → on cherche un autre widget pour
+            # appeler on_done sur le main thread. self.master pointe sur la
+            # fenêtre principale (App) qui devrait être vivante.
+            master = getattr(self, "master", None)
+            if master is not None and on_done is not None:
+                try:
+                    master.after(0, lambda: on_done(result, err))
+                    return
+                except Exception:
+                    pass
+
+            # Dernier recours : appeler on_done depuis ce thread. Pas idéal
+            # (callbacks UI Tk doivent vivre sur le main thread), mais mieux
+            # que de laisser l'user sans feedback. Les implémentations
+            # actuelles d'on_done lancent un messagebox qui sait gérer ça.
+            if on_done is not None:
+                try:
+                    on_done(result, err)
                 except Exception:
                     pass
 

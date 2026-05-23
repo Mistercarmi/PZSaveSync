@@ -396,7 +396,37 @@ def discover_companion_files(
     if cf.db is not None or cf.ini is not None:
         return cf  # match exact partiel ou complet → on garde
 
-    # --- Inférence : aucun match exact ---
+    # --- Variant "_" → " " (cas Server name avec espaces) ---
+    # PZ génère le nom de save_dir en remplaçant les espaces du Server name
+    # par des underscores. Donc un save_name="Pitrou_newbies" provient
+    # typiquement d'un Server name "Pitrou newbies" avec .ini/.db nommés
+    # à l'identique (espaces). On teste cette transformation canonique
+    # AVANT de tomber dans l'inférence mtime, qui peut se tromper quand
+    # plusieurs serveurs ont des mtimes proches (3+ saves chez un hôte).
+    if "_" in save_name:
+        variant = save_name.replace("_", " ")
+        variant_db = db_dir / f"{variant}.db"
+        variant_ini = server_dir / f"{variant}.ini"
+        if variant_db.exists() or variant_ini.exists():
+            cf.exact_match = False
+            cf.server_prefix = variant
+            if variant_db.exists():
+                cf.db = variant_db
+                cf.db_companions = _find_db_companions(variant_db)
+            if variant_ini.exists():
+                cf.ini = variant_ini
+            variant_sandbox = server_dir / f"{variant}_SandboxVars.lua"
+            if variant_sandbox.exists():
+                cf.sandbox = variant_sandbox
+            variant_spawn = server_dir / f"{variant}_spawnregions.lua"
+            if variant_spawn.exists():
+                cf.spawn = variant_spawn
+            variant_spawn_points = server_dir / f"{variant}_spawnpoints.lua"
+            if variant_spawn_points.exists():
+                cf.spawn_points = variant_spawn_points
+            return cf
+
+    # --- Inférence : aucun match exact ni variant ---
     if not save_dir.exists():
         return cf  # rien à corréler
     save_mtime = save_dir.stat().st_mtime

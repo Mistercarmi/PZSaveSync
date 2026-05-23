@@ -86,7 +86,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 
 
 _AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)

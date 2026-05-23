@@ -3,6 +3,36 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.3.7] — 2026-05-23
+
+### Fixed — inférence de companions piégée par plusieurs serveurs concurrents
+
+- **`discover_companion_files` choisissait le mauvais `.ini`/`.db` quand un
+  hôte avait 3+ serveurs et que les `save_dir` partageaient des mtimes proches**
+  (typique après une extraction zip qui touche toutes les save_dir à la même
+  seconde). L'inférence mtime, faute de variant exact, sélectionnait
+  silencieusement le set Server le plus récent — y compris d'un AUTRE serveur.
+  Un push embarquait alors la DB + config d'un serveur dans un bundle d'un
+  autre serveur → corruption garantie chez le destinataire à l'extraction.
+- **Cause racine** : PZ remplace systématiquement les espaces du *Server name*
+  par des underscores quand il crée le dossier `Saves/Multiplayer/<save>/`.
+  Donc un World name `My_Save` provient typiquement d'un Server name `My Save`
+  avec `.ini`/`.db` nommés à l'identique (espaces). Le code ne testait pas
+  cette transformation canonique et tombait direct dans l'inférence mtime.
+- **Fix** : nouveau niveau « variant `_` → ` ` » inséré entre le match exact
+  et l'inférence mtime. Si le match exact échoue, on tente d'abord
+  `save_name.replace("_", " ")` comme prefix Server/db. Match déterministe
+  basé sur la convention PZ, donc forte confiance (`exact_match=False`
+  conservé pour transparence dans le manifest).
+
+### Tests
+- **+2 tests** dans `test_bundle_discovery.py` :
+  - reproduit le cas avec 2 serveurs (cible « espace » + distracteur « espace »
+    de mtime plus récente) → vérifie qu'on choisit le bon
+  - garantit qu'un match exact (`My_Save.ini` existant réellement) reste
+    prioritaire sur le variant (`My Save.ini`), pour ne pas casser les
+    setups où le World name a volontairement des underscores
+
 ## [0.3.6] — 2026-05-22
 
 ### Fixed — parsing INI cassé sur BOM UTF-8 (audit phase 3)

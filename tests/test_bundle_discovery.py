@@ -222,6 +222,76 @@ def test_extract_bundle_with_renamed_files_works_end_to_end(tmp_path):
     assert (dest_root / "Server" / "MaSave_spawnregions.lua").exists()
 
 
+def test_discover_underscore_to_space_variant(tmp_path):
+    """Cas réel rencontré sur le dump d'un hôte avec 3 serveurs : un World name
+    "Pitrou_newbies" provient d'un Server name "Pitrou newbies" (espaces). Le
+    code doit choisir ce set même si un autre set (Gitano Z) a une mtime plus
+    proche de la save_dir (situation typique après extraction zip qui touche
+    toutes les save_dir à la même heure).
+    """
+    # Set "Pitrou newbies" : le BON match pour Pitrou_newbies, mais mtime ancien
+    long_ago = time.time() - 3 * 24 * 3600  # 3 jours avant
+    for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
+        f = tmp_path / "Server" / f"Pitrou newbies{suffix}"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("PVP=true\n", encoding="utf-8")
+        os.utime(f, (long_ago, long_ago))
+    db_p = tmp_path / "db" / "Pitrou newbies.db"
+    db_p.parent.mkdir(parents=True, exist_ok=True)
+    db_p.write_bytes(b"SQLite-pitrou")
+    os.utime(db_p, (long_ago, long_ago))
+
+    # Save_dir Pitrou_newbies : mtime "maintenant"
+    save_dir = tmp_path / "Saves" / "Multiplayer" / "Pitrou_newbies"
+    save_dir.mkdir(parents=True)
+    (save_dir / "map_0_0.bin").write_bytes(b"chunk")
+
+    # Set distracteur "Gitano Z" : mtime "maintenant" (piège pour inférence mtime)
+    now = time.time()
+    for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua"):
+        f = tmp_path / "Server" / f"Gitano Z{suffix}"
+        f.write_text("PVP=true\n", encoding="utf-8")
+        os.utime(f, (now, now))
+    gitano_db = tmp_path / "db" / "Gitano Z.db"
+    gitano_db.write_bytes(b"SQLite-gitano")
+    os.utime(gitano_db, (now, now))
+    os.utime(save_dir, (now, now))
+
+    cf = bundle_mod.discover_companion_files("Pitrou_newbies", root=tmp_path)
+    assert cf.exact_match is False
+    assert cf.server_prefix == "Pitrou newbies", (
+        "Le variant '_' -> ' ' doit être tenté AVANT l'inférence mtime, qui "
+        f"sinon choisirait 'Gitano Z' (plus récent). Obtenu: {cf.server_prefix!r}"
+    )
+    assert cf.ini is not None and cf.ini.name == "Pitrou newbies.ini"
+    assert cf.db is not None and cf.db.name == "Pitrou newbies.db"
+    assert cf.sandbox is not None and cf.sandbox.name == "Pitrou newbies_SandboxVars.lua"
+    assert cf.spawn is not None and cf.spawn.name == "Pitrou newbies_spawnregions.lua"
+
+
+def test_discover_underscore_variant_only_when_no_exact_match(tmp_path):
+    """Si un .ini avec underscore EXISTE (ex: "My_Save.ini"), on doit le
+    prendre — pas chercher "My Save.ini" qui pourrait être un autre serveur."""
+    save_dir = tmp_path / "Saves" / "Multiplayer" / "My_Save"
+    save_dir.mkdir(parents=True)
+    (save_dir / "map_0_0.bin").write_bytes(b"chunk")
+
+    (tmp_path / "Server").mkdir()
+    (tmp_path / "db").mkdir()
+    # Match exact disponible
+    (tmp_path / "Server" / "My_Save.ini").write_text("PVP=true\n")
+    (tmp_path / "db" / "My_Save.db").write_bytes(b"exact")
+    # Variant qui existe AUSSI (piège : un autre serveur du même hôte)
+    (tmp_path / "Server" / "My Save.ini").write_text("PVP=false\n")
+    (tmp_path / "db" / "My Save.db").write_bytes(b"variant")
+
+    cf = bundle_mod.discover_companion_files("My_Save", root=tmp_path)
+    assert cf.exact_match is True
+    assert cf.server_prefix == "My_Save"
+    assert cf.ini.name == "My_Save.ini"
+    assert cf.db.name == "My_Save.db"
+
+
 def test_find_companions_exposes_inferred_files(tmp_path):
     """find_companions (wrapper rétro-compat utilisé par la GUI) voit les
     fichiers inférés pour que la liste des saves marque la save comme

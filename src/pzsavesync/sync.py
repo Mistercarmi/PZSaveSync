@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pzsavesync import bundle as bundle_mod  # utilisé dans health_check/adopt_orphans
+from pzsavesync import snapshot as snapshot_mod
+from pzsavesync.bundle import BundleMode
+from pzsavesync.diff_errors import (
+    NoSnapshotAvailableError,
+    ParentBundleSHAmismatchError,
+)
+
+_log = logging.getLogger(__name__)
 
 VERSIONS_DIRNAME = "versions"
 LOCK_FILENAME = "lock.json"
@@ -31,6 +40,44 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _estimate_full_bundle_size(save_name: str, root: Path | None) -> int:
+    """Estime la taille (uncompressed) qu'aurait un bundle FULL pour cette save.
+
+    Utilisé pour calculer le gain ratio à afficher dans l'UI. Approche pessimiste
+    (compte les sources uncompressed) — la valeur reflète "ce qu'on a évité de
+    zipper et d'envoyer" plus que "taille zip économisée". Suffisant pour
+    l'affichage utilisateur ("X MB → Y MB").
+    """
+    root = root or bundle_mod.zomboid_root()
+    save_dir = root / "Saves" / "Multiplayer" / save_name
+    total = 0
+    if save_dir.exists():
+        for f in save_dir.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    continue
+    # Ajouter db + server (négligeable mais réaliste)
+    try:
+        cf = bundle_mod.discover_companion_files(save_name, root)
+        if cf.db is not None:
+            total += cf.db.stat().st_size
+        for comp in cf.db_companions:
+            try:
+                total += comp.stat().st_size
+            except OSError:
+                pass
+        for srv in cf.server_files:
+            try:
+                total += srv.stat().st_size
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return total
+
+
 @dataclass
 class Lock:
     holder: str
@@ -51,6 +98,10 @@ class Version:
     has_db: bool = False
     server_files: list[str] | None = None
     note: str = ""
+    # --- v0.4.0 : champs bundle différentiel ---
+    bundle_mode: str = "full"  # "full" | "diff"
+    parent_bundle_sha256: str = ""  # vide si full ; sha du parent si diff
+    full_size_estimate_bytes: int = 0  # taille estimée si on avait fait un full (pour afficher le gain)
 
     def to_dict(self) -> dict:
         return {
@@ -62,7 +113,34 @@ class Version:
             "has_db": self.has_db,
             "server_files": self.server_files or [],
             "note": self.note,
+            "bundle_mode": self.bundle_mode,
+            "parent_bundle_sha256": self.parent_bundle_sha256,
+            "full_size_estimate_bytes": self.full_size_estimate_bytes,
         }
+
+
+@dataclass
+class PushStats:
+    """Stats post-push pour l'affichage UI du gain.
+
+    `mode_used` est ce qui a été effectivement utilisé (peut différer du mode
+    demandé en cas de fallback AUTO → FULL).
+    """
+    mode_used: str  # "full" | "diff"
+    full_size_estimate_bytes: int
+    actual_size_bytes: int
+    files_total_in_save: int = 0
+    files_pushed: int = 0
+    files_unchanged_skipped: int = 0
+
+    @property
+    def gain_ratio(self) -> float:
+        """Ratio 0.0-1.0 d'économie vs full. 0 si pas de gain (full)."""
+        if self.full_size_estimate_bytes == 0 or self.mode_used == "full":
+            return 0.0
+        if self.actual_size_bytes >= self.full_size_estimate_bytes:
+            return 0.0
+        return 1.0 - (self.actual_size_bytes / self.full_size_estimate_bytes)
 
 
 @dataclass
@@ -320,13 +398,20 @@ class SharedRepo:
     def list_versions(self) -> list[Version]:
         manifest = self._read_manifest()
         out: list[Version] = []
+        # Filtrer aux seuls champs connus de Version pour tolérer
+        # les manifestes pré-v0.4.0 et les éventuels champs futurs.
+        known = set(Version.__dataclass_fields__.keys())
         for v in manifest.get("versions", []):
-            # Compat anciens manifestes
             v = dict(v)
             v.setdefault("save_name", "")
             v.setdefault("has_db", False)
             v.setdefault("server_files", [])
-            out.append(Version(**v))
+            # Compat v0.4.0
+            v.setdefault("bundle_mode", "full")
+            v.setdefault("parent_bundle_sha256", "")
+            v.setdefault("full_size_estimate_bytes", 0)
+            filtered = {k: val for k, val in v.items() if k in known}
+            out.append(Version(**filtered))
         return out
 
     def latest_version(self) -> Version | None:
@@ -340,14 +425,32 @@ class SharedRepo:
         note: str = "",
         progress: bundle_mod.ProgressCb | None = None,
         root: Path | None = None,
-    ) -> Version:
-        """Crée un bundle complet (save+db+config) et le pousse dans le dossier partagé.
+        *,
+        mode: BundleMode = BundleMode.FULL,
+    ) -> tuple[Version, PushStats]:
+        """Crée un bundle (full ou diff) et le pousse dans le dossier partagé.
+
+        - mode=FULL : comportement v0.3.x (bundle complet save+db+server).
+        - mode=DIFF : nécessite un snapshot pré-existant pour cette save (post-pull).
+          Vérifie aussi que le parent_sha == latest_version.sha256 du cloud (sinon
+          `ParentBundleSHAmismatchError` — quelqu'un a poussé entre temps).
+        - mode=AUTO : DIFF si snapshot disponible ET parent_sha cohérent, sinon FULL.
+
+        Retourne (Version persistée, PushStats pour l'UI).
 
         `progress` est transmis à `build_bundle` pour l'UI de progression.
-        `root` permet d'injecter une racine Zomboid alternative (tests, $PZ_ZOMBOID_ROOT
-        est honoré par défaut côté bundle).
+        `root` permet d'injecter une racine Zomboid alternative (tests).
         """
         self.init_if_needed()
+
+        # Estimer la taille d'un full pour pouvoir afficher le gain réalisé
+        full_size_estimate = _estimate_full_bundle_size(save_name, root)
+
+        # Préparer le mode + snapshot parent
+        actual_mode, parent_snapshot = self._resolve_mode_and_snapshot(
+            save_name=save_name, requested_mode=mode,
+        )
+
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         safe_user = "".join(c for c in uploaded_by if c.isalnum() or c in "-_") or "anon"
         safe_save = "".join(c for c in save_name if c.isalnum() or c in "-_") or "save"
@@ -361,29 +464,123 @@ class SharedRepo:
             note=note,
             root=root,
             progress=progress,
+            mode=actual_mode,
+            parent_snapshot=parent_snapshot,
         )
+
+        actual_size = target.stat().st_size
 
         version = Version(
             filename=filename,
             save_name=save_name,
             uploaded_by=uploaded_by,
             uploaded_at=manifest.created_at,
-            size_bytes=target.stat().st_size,
+            size_bytes=actual_size,
             has_db=manifest.has_db,
             server_files=manifest.server_files,
             note=note,
+            bundle_mode=manifest.bundle_mode,
+            parent_bundle_sha256=manifest.parent_bundle_sha256,
+            full_size_estimate_bytes=full_size_estimate,
         )
         data = self._read_manifest()
         data.setdefault("versions", []).append(version.to_dict())
         self._write_manifest(data)
-        return version
+
+        stats = PushStats(
+            mode_used=manifest.bundle_mode,
+            full_size_estimate_bytes=full_size_estimate,
+            actual_size_bytes=actual_size,
+            files_total_in_save=len(manifest.expected_save_files) if manifest.expected_save_files else manifest.save_files,
+            files_pushed=manifest.save_files,
+            files_unchanged_skipped=(
+                max(0, len(manifest.expected_save_files) - len(manifest.diff_files))
+                if manifest.bundle_mode == "diff" else 0
+            ),
+        )
+        return version, stats
+
+    def _resolve_mode_and_snapshot(
+        self, save_name: str, requested_mode: BundleMode,
+    ) -> tuple[BundleMode, "snapshot_mod.Snapshot | None"]:
+        """Détermine le mode effectif + charge le snapshot parent si applicable.
+
+        Effets :
+        - FULL : retourne (FULL, None) sans rien charger.
+        - DIFF explicite : charge le snapshot, vérifie parent SHA, raise si KO.
+        - AUTO : essaie DIFF, fallback FULL silencieux si pas de snapshot ou
+          si parent SHA mismatch (UI peut alerter via PushStats).
+        """
+        if requested_mode == BundleMode.FULL:
+            return BundleMode.FULL, None
+
+        # Charger le snapshot le plus récent pour cette save
+        try:
+            snap = snapshot_mod.find_latest_snapshot_for_save(save_name)
+        except Exception as e:
+            _log.warning("Lecture snapshot échouée (%s) — fallback FULL", e)
+            snap = None
+
+        if snap is None:
+            if requested_mode == BundleMode.DIFF:
+                raise NoSnapshotAvailableError(
+                    f"Pas de snapshot pour '{save_name}'. Importe d'abord un bundle "
+                    f"depuis le cloud pour créer un snapshot, ou utilise le mode FULL."
+                )
+            # AUTO : fallback silencieux
+            return BundleMode.FULL, None
+
+        # Vérifier que parent SHA == latest_version.sha (on n'a pas pris de retard)
+        latest = self.latest_version()
+        if latest is not None and latest.parent_bundle_sha256:
+            # latest est elle-même un diff — pour matcher, on doit pouvoir lire
+            # son zip et extraire son sha256
+            pass  # on tolère, edge case rare
+        if latest is not None:
+            # Récupérer le sha du bundle latest depuis son zip (manifest interne)
+            try:
+                latest_manifest = bundle_mod.read_manifest(self.versions_dir / latest.filename)
+                latest_sha = latest_manifest.sha256
+            except Exception:
+                latest_sha = ""
+
+            if latest_sha and snap.parent_bundle_sha256 != latest_sha:
+                if requested_mode == BundleMode.DIFF:
+                    raise ParentBundleSHAmismatchError(
+                        "Un autre joueur a poussé une nouvelle version depuis ton dernier import. "
+                        "Pull la dernière version avant de re-pousser un diff."
+                    )
+                # AUTO : fallback FULL silencieux
+                _log.info("AUTO push : parent SHA mismatch, fallback FULL")
+                return BundleMode.FULL, None
+
+        return BundleMode.DIFF, snap
 
     def pull_bundle(self, version: Version, backup_dir: Path):
-        """Restaure le bundle d'une version. Backup automatique de l'existant."""
+        """Restaure le bundle d'une version. Backup automatique de l'existant.
+
+        Après extract réussi, calcule un snapshot SHA256 du save_dir local pour
+        permettre les futurs push différentiels. Échec snapshot = non-bloquant.
+        """
         archive = self.versions_dir / version.filename
         if not archive.exists():
             raise FileNotFoundError(f"Archive manquante : {archive}")
-        return bundle_mod.extract_bundle(archive, backup_dir=backup_dir)
+        report = bundle_mod.extract_bundle(archive, backup_dir=backup_dir)
+
+        # Snapshot post-import (best-effort, ne bloque pas le pull si échoue)
+        try:
+            manifest = bundle_mod.read_manifest(archive)
+            snap = snapshot_mod.compute_snapshot(
+                save_dir=report.save_dir,
+                save_name=report.save_name,
+                parent_sha=manifest.sha256,
+                parent_filename=version.filename,
+            )
+            snapshot_mod.save_snapshot(snap)
+        except Exception as e:
+            _log.warning("Snapshot post-import échoué (%s) — push diff indisponible jusqu'à un nouveau pull", e)
+
+        return report
 
     # ---------- nettoyage ----------
     # Minimum de versions à conserver côté cloud pour pouvoir rollback si

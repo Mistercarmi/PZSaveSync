@@ -112,12 +112,13 @@ def test_spawnpoints_inferred_when_server_name_differs(tmp_path):
 
     out = tmp_path / "bundle.zip"
     m = bundle_mod.build_bundle(save_name, out, "alice", root=tmp_path)
-    assert f"{save_name}_spawnpoints.lua" in m.server_files
+    # v0.4.0 fix bug map M : noms d'origine préservés (pas renommés sous save_name)
+    assert f"{prefix}_spawnpoints.lua" in m.server_files
     with zipfile.ZipFile(out, "r") as zf:
         names = set(zf.namelist())
-    # Renommé sous save_name côté destinataire
-    assert f"server/{save_name}_spawnpoints.lua" in names
-    assert f"server/{prefix}_spawnpoints.lua" not in names
+    # Sous nom d'origine, PAS renommé sous save_name
+    assert f"server/{prefix}_spawnpoints.lua" in names
+    assert f"server/{save_name}_spawnpoints.lua" not in names
 
 
 # -----------------------------------------------------------------------------

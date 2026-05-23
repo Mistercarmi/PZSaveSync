@@ -22,18 +22,58 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import shutil
 import zipfile
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+_log = logging.getLogger(__name__)
+
+from pzsavesync.diff_errors import (
+    DiffTooBigError,
+    InvalidDiffManifestError,
+    NoSnapshotAvailableError,
+)
+
 
 MANIFEST_FILENAME = "bundle_manifest.json"
-BUNDLE_VERSION = 3  # v3 : ajout _spawnpoints.lua + fichiers SQLite WAL/SHM/journal
+BUNDLE_VERSION = 4  # v4 : bundle différentiel (mode full/diff, parent_bundle_sha256, expected_save_files)
 _REQUIRED_MANIFEST_FIELDS = ("bundle_version", "save_name", "created_at", "created_by")
 _BAD_NAME_CHARS = '<>:"/\\|?*'
+
+# Patterns exclus systématiquement d'un bundle DIFF (caches debug régénérables).
+# Mesuré sur Gitano_Z : ~826 KB économisés par push.
+DIFF_REDUNDANT_PATTERNS = (
+    "WorldDictionaryReadable.lua",
+    "WorldDictionaryLog.lua",
+)
+
+# Au-delà de ce ratio de fichiers modifiés, on refuse le diff et l'appelant
+# doit fallback en FULL (le gain devient marginal et le risque de divergence
+# augmente). Mesure relative à la taille du snapshot parent.
+DIFF_FALLBACK_THRESHOLD_RATIO = 0.85
+
+
+class BundleMode(str, Enum):
+    """Mode de bundling.
+
+    - FULL : bundle complet (save_dir + db + server). Comportement v0.3.x.
+      Toujours utilisé pour le seed initial envoyé par l'hôte.
+    - DIFF : bundle différentiel — uniquement les fichiers modifiés depuis
+      l'import du bundle parent. Référencé par parent_bundle_sha256.
+    - AUTO : choisit DIFF si un snapshot valide est trouvé pour cette save,
+      sinon fallback FULL silencieux. Mode par défaut côté push retour client.
+    """
+    FULL = "full"
+    DIFF = "diff"
+    AUTO = "auto"
+
+
+_VALID_BUNDLE_MODES_ON_DISK = {BundleMode.FULL.value, BundleMode.DIFF.value}
 
 # Suffixes SQLite compagnons d'un fichier .db (mode WAL principalement).
 # Si PZ est tué avant checkpoint, .db-wal contient les dernières transactions
@@ -65,6 +105,15 @@ class BundleManifest:
     workshop_items: list[str] = field(default_factory=list)
     sha256: str = ""  # depuis v2 : hash du contenu (hors champ sha256 lui-même)
     inferred_server_prefix: str = ""  # depuis v3 : prefix utilisé côté hôte si != save_name
+
+    # --- v4 (bundle différentiel) ---
+    bundle_mode: str = "full"  # "full" | "diff"
+    parent_bundle_sha256: str = ""  # SHA du bundle source d'un diff (vide si full)
+    parent_bundle_filename: str = ""  # nom du zip importé (debug / forensics)
+    expected_save_files: dict[str, str] = field(default_factory=dict)  # rel_path → SHA256, état final attendu
+    diff_files: list[str] = field(default_factory=list)  # sous-set RÉELLEMENT zippé
+    deleted_files: list[str] = field(default_factory=list)  # à supprimer côté hôte (v0.4.0 toujours vide)
+    excluded_categories: list[str] = field(default_factory=list)  # traçabilité (ex: ["db", "server"])
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -116,16 +165,21 @@ def _sha256_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _sha256_of_zip_content(zip_path: Path) -> str:
+def _sha256_of_zip_content(zip_path: Path, progress: "ProgressCb | None" = None) -> str:
     """Hash du contenu du zip, en excluant le manifest (qui contient le hash lui-même).
 
     On hash : pour chaque membre (trié), nom + taille + contenu — comme ça l'ordre
     de compression n'influence pas le résultat.
+
+    Si `progress` est fourni, il est appelé toutes les ~50 entrées avec
+    `progress("hash", traitées, total)` pour que la barre UI ne reste pas
+    figée pendant 5-15 sec sur les gros bundles (52k+ fichiers).
     """
     h = hashlib.sha256()
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = sorted(n for n in zf.namelist() if n != MANIFEST_FILENAME)
-        for name in names:
+        total = len(names)
+        for i, name in enumerate(names):
             info = zf.getinfo(name)
             h.update(name.encode("utf-8"))
             h.update(b"|")
@@ -137,6 +191,8 @@ def _sha256_of_zip_content(zip_path: Path) -> str:
                     if not chunk:
                         break
                     h.update(chunk)
+            if progress and (i % 50 == 0 or i == total - 1):
+                progress("hash", i + 1, total)
     return h.hexdigest()
 
 
@@ -491,14 +547,59 @@ def build_bundle(
     note: str = "",
     root: Path | None = None,
     progress: ProgressCb | None = None,
+    *,
+    mode: "BundleMode" = BundleMode.FULL,
+    parent_snapshot: "object | None" = None,  # type: Snapshot — typé via importation tardive pour éviter cycle
+    diff_excludes_categories: list[str] | None = None,
 ) -> BundleManifest:
     """Crée un bundle zip à partir d'une save locale (écriture atomique).
+
+    - mode=FULL (défaut) : bundle complet save + db + server (comportement v0.3.x).
+      Toujours utilisé pour le seed initial.
+    - mode=DIFF : bundle différentiel — uniquement les fichiers added/modified
+      depuis le snapshot parent. Nécessite parent_snapshot non-None.
+      Par défaut, exclut les catégories ["db", "server"] (l'hôte = source de vérité).
+    - mode=AUTO : choisit DIFF si parent_snapshot fourni, sinon FULL.
 
     Si `progress` est fourni, il est appelé pendant le zip avec :
         progress("zip", fichiers_traités, fichiers_totaux)
     Et à la fin :
         progress("hash", 1, 1)
+
+    Raises:
+        NoSnapshotAvailableError: mode=DIFF mais parent_snapshot=None.
+        DiffTooBigError: trop de fichiers modifiés (> 85%), appelant doit fallback FULL.
     """
+    if mode == BundleMode.DIFF and parent_snapshot is None:
+        raise NoSnapshotAvailableError(
+            "Mode DIFF demandé mais aucun snapshot parent fourni. "
+            "Utilise AUTO si tu veux un fallback FULL silencieux."
+        )
+
+    if mode == BundleMode.AUTO:
+        mode = BundleMode.DIFF if parent_snapshot is not None else BundleMode.FULL
+
+    if mode == BundleMode.DIFF:
+        excludes = list(diff_excludes_categories) if diff_excludes_categories is not None else ["db", "server"]
+        return _build_diff_bundle(
+            save_name=save_name, out_zip=out_zip, created_by=created_by, note=note,
+            root=root, progress=progress, parent_snapshot=parent_snapshot, excludes=excludes,
+        )
+    return _build_full_bundle(
+        save_name=save_name, out_zip=out_zip, created_by=created_by, note=note,
+        root=root, progress=progress,
+    )
+
+
+def _build_full_bundle(
+    save_name: str,
+    out_zip: Path,
+    created_by: str,
+    note: str,
+    root: Path | None,
+    progress: ProgressCb | None,
+) -> BundleManifest:
+    """Mode FULL — code v0.3.x inchangé. Inclut save_dir + db + server."""
     _validate_save_name(save_name)
     root = root or zomboid_root()
     save_dir = root / "Saves" / "Multiplayer" / save_name
@@ -524,15 +625,20 @@ def build_bundle(
                     db_companion_pairs.append((comp, f"{save_name}.db{sfx}"))
                     break
 
+    # v0.4.0 — fix bug map M : on PRÉSERVE le nom d'origine des fichiers server
+    # (avec espaces si applicable, ex "Gitano Z.ini" et non "Gitano_Z.ini").
+    # Sans ça, le destinataire restaure sous un Server name underscoré, et son
+    # dossier `<steamid>_<Server name>_player/` (qui contient la mini-map M
+    # révélée) devient orphelin → map perdue après un round-trip push/pull.
     server_pairs: list[tuple[Path, str]] = []
     if cf.ini is not None:
-        server_pairs.append((cf.ini, f"{save_name}.ini"))
+        server_pairs.append((cf.ini, cf.ini.name))
     if cf.sandbox is not None:
-        server_pairs.append((cf.sandbox, f"{save_name}_SandboxVars.lua"))
+        server_pairs.append((cf.sandbox, cf.sandbox.name))
     if cf.spawn is not None:
-        server_pairs.append((cf.spawn, f"{save_name}_spawnregions.lua"))
+        server_pairs.append((cf.spawn, cf.spawn.name))
     if cf.spawn_points is not None:
-        server_pairs.append((cf.spawn_points, f"{save_name}_spawnpoints.lua"))
+        server_pairs.append((cf.spawn_points, cf.spawn_points.name))
 
     # Pré-scan pour avoir le total de fichiers (pour la barre de progression)
     if progress:
@@ -614,8 +720,134 @@ def build_bundle(
         # Calculer le hash du contenu (hors manifest) et réécrire le manifest avec
         if progress:
             progress("hash", 0, 1)
-        manifest.sha256 = _sha256_of_zip_content(tmp_zip)
+        manifest.sha256 = _sha256_of_zip_content(tmp_zip, progress=progress)
         # Réécrire le manifest dans le zip avec le sha256
+        _rewrite_manifest_in_zip(tmp_zip, manifest)
+        if progress:
+            progress("hash", 1, 1)
+
+        os.replace(tmp_zip, out_zip)
+    except Exception:
+        try:
+            tmp_zip.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    return manifest
+
+
+def _is_redundant_for_diff(rel_path: str) -> bool:
+    """Vrai si ce fichier (chemin relatif POSIX sous save/) doit être exclu d'un diff."""
+    name = rel_path.rsplit("/", 1)[-1]
+    return name in DIFF_REDUNDANT_PATTERNS
+
+
+def _build_diff_bundle(
+    save_name: str,
+    out_zip: Path,
+    created_by: str,
+    note: str,
+    root: Path | None,
+    progress: ProgressCb | None,
+    parent_snapshot: "object",  # type: Snapshot — typé tard pour éviter cycle
+    excludes: list[str],
+) -> BundleManifest:
+    """Mode DIFF — n'inclut que les fichiers added/modified depuis parent_snapshot.
+
+    - Pas de db/, pas de server/ (exclusions par défaut — l'hôte reste source
+      de vérité pour ces fichiers).
+    - Filtre les patterns DIFF_REDUNDANT_PATTERNS (caches debug regen).
+    - Si > DIFF_FALLBACK_THRESHOLD_RATIO de fichiers modifiés → raise DiffTooBigError.
+    """
+    # Import tardif pour éviter le cycle bundle ↔ snapshot
+    from pzsavesync.snapshot import Snapshot, diff_against_snapshot
+
+    if not isinstance(parent_snapshot, Snapshot):
+        raise TypeError(
+            f"parent_snapshot doit être un Snapshot, reçu : {type(parent_snapshot).__name__}"
+        )
+
+    _validate_save_name(save_name)
+    root = root or zomboid_root()
+    save_dir = root / "Saves" / "Multiplayer" / save_name
+    if not save_dir.exists():
+        raise FileNotFoundError(
+            f"Save '{save_name}' introuvable sous {save_dir}. "
+            "Vérifie que tu as bien hébergé/joué cette partie au moins une fois."
+        )
+
+    # ---- Calcul du diff ----
+    if progress:
+        progress("scan", 0, 1)
+    diff = diff_against_snapshot(parent_snapshot, save_dir, progress=progress)
+
+    # Candidats : added + modified, filtrés par DIFF_REDUNDANT_PATTERNS
+    candidates = [p for p in (diff.added + diff.modified) if not _is_redundant_for_diff(p)]
+
+    # Garde-fou : si trop de fichiers EXISTANTS NON-REDONDANTS ont été modifiés,
+    # fallback FULL. Note :
+    # - On ne compte PAS les `added` (explorer normal = beaucoup d'ajouts).
+    # - On ne compte PAS les redondants (WorldDictionary*.lua sont regenerés à
+    #   chaque session — toujours "modifiés" mais ne signalent rien d'inhabituel).
+    non_redundant_snap = [k for k in parent_snapshot.save_files if not _is_redundant_for_diff(k)]
+    snap_total = len(non_redundant_snap)
+    if snap_total > 0:
+        non_redundant_modified = [p for p in diff.modified if not _is_redundant_for_diff(p)]
+        ratio_modified = len(non_redundant_modified) / snap_total
+        if ratio_modified > DIFF_FALLBACK_THRESHOLD_RATIO:
+            raise DiffTooBigError(
+                f"Trop de fichiers existants modifiés ({ratio_modified:.0%} > "
+                f"{DIFF_FALLBACK_THRESHOLD_RATIO:.0%}). Bascule en mode FULL pour ce push."
+            )
+
+    # ---- Construction du manifest ----
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    manifest = BundleManifest(
+        bundle_version=BUNDLE_VERSION,
+        save_name=save_name,
+        created_at=dt.datetime.now().isoformat(timespec="seconds"),
+        created_by=created_by,
+        note=note,
+        bundle_mode=BundleMode.DIFF.value,
+        parent_bundle_sha256=parent_snapshot.parent_bundle_sha256,
+        parent_bundle_filename=parent_snapshot.parent_bundle_filename,
+        expected_save_files=dict(diff.current_hashes),
+        diff_files=list(candidates),
+        deleted_files=[],  # v0.4.0 : on ignore les suppressions
+        excluded_categories=list(excludes),
+    )
+
+    total = len(candidates)
+    if progress:
+        progress("scan", total, total)
+
+    # ---- Écriture atomique du zip ----
+    tmp_zip = out_zip.with_suffix(out_zip.suffix + ".tmp")
+    done = 0
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel in candidates:
+                src = save_dir / rel
+                if not src.exists():
+                    # Le fichier a disparu entre le hash diff et le zip — skip
+                    continue
+                zf.write(src, f"save/{rel}")
+                manifest.save_files += 1
+                try:
+                    manifest.save_bytes += src.stat().st_size
+                except OSError:
+                    pass
+                done += 1
+                if progress and done % 8 == 0:
+                    progress("zip", done, total)
+
+            # Manifest provisoire (sha256 calculé après)
+            zf.writestr(MANIFEST_FILENAME, json.dumps(manifest.to_dict(), indent=2))
+
+        if progress:
+            progress("hash", 0, 1)
+        manifest.sha256 = _sha256_of_zip_content(tmp_zip, progress=progress)
         _rewrite_manifest_in_zip(tmp_zip, manifest)
         if progress:
             progress("hash", 1, 1)
@@ -679,9 +911,27 @@ def read_manifest(zip_path: Path) -> BundleManifest:
     known = set(BundleManifest.__dataclass_fields__.keys())
     filtered = {k: v for k, v in data.items() if k in known}
     try:
-        return BundleManifest(**filtered)
+        manifest = BundleManifest(**filtered)
     except TypeError as e:
         raise ValueError(f"Manifest invalide : {e}")
+
+    # Validation v4 : mode autorisé + cohérence si mode == diff
+    if manifest.bundle_mode and manifest.bundle_mode not in _VALID_BUNDLE_MODES_ON_DISK:
+        raise ValueError(
+            f"Manifest invalide : bundle_mode='{manifest.bundle_mode}' inconnu "
+            f"(attendu : {sorted(_VALID_BUNDLE_MODES_ON_DISK)})."
+        )
+    if manifest.bundle_mode == "diff":
+        if not manifest.parent_bundle_sha256:
+            raise InvalidDiffManifestError(
+                "Manifest diff incomplet : parent_bundle_sha256 manquant."
+            )
+        if not manifest.expected_save_files:
+            raise InvalidDiffManifestError(
+                "Manifest diff incomplet : expected_save_files vide."
+            )
+
+    return manifest
 
 
 @dataclass
@@ -693,13 +943,96 @@ class ExtractReport:
     backed_up_to: Path | None
     mods: list[str] = field(default_factory=list)
     workshop_items: list[str] = field(default_factory=list)
+    # v0.4.0 : candidats de renommage du dossier `<steamid>_<OLD>_player/` →
+    # `<steamid>_<NEW>_player/` pour préserver la mini-map M révélée par chaque
+    # joueur. Liste de tuples (chemin actuel, chemin cible proposé).
+    # Vide si pas de candidats à renommer. L'UI propose le renommage à l'user.
+    map_orphan_candidates: list[tuple[Path, Path]] = field(default_factory=list)
 
 
-def verify_bundle_integrity(zip_path: Path) -> tuple[bool, str]:
+_PLAYER_MAP_DIR_PATTERN = __import__("re").compile(r"^(\d+)_(.+)_player$")
+
+
+def detect_orphan_player_map_dirs(
+    new_server_prefix: str, root: Path | None = None,
+) -> list[tuple[Path, Path]]:
+    """Détecte les dossiers `<steamid>_<OLD>_player/` qui devraient être renommés
+    vers `<steamid>_<NEW>_player/` pour préserver la mini-map M révélée.
+
+    PZ stocke la mini-map M (touche M) de chaque joueur localement dans
+    `Saves/Multiplayer/<steamid>_<Server name>_player/`. Si le Server name
+    change subtilement entre 2 sessions (typiquement espaces ↔ underscores
+    après un push/pull mal géré en v0.3.x), PZ ne retrouve plus ce dossier
+    et crée un nouveau dossier vide → l'utilisateur perd sa map révélée.
+
+    Cette fonction détecte les dossiers candidates au renommage :
+    - Pattern : `<steamid>_<X>_player/` avec X != new_server_prefix
+    - Mais X normalisé (espaces→underscores) == new_server_prefix normalisé
+    - Et la cible `<steamid>_<new_server_prefix>_player/` n'existe pas déjà
+
+    L'UI peut ensuite proposer le renommage à l'utilisateur (action réversible).
+    """
+    root = root or zomboid_root()
+    multiplayer_dir = root / "Saves" / "Multiplayer"
+    if not multiplayer_dir.exists():
+        return []
+
+    candidates: list[tuple[Path, Path]] = []
+    new_normalized = new_server_prefix.replace(" ", "_")
+
+    try:
+        entries = list(multiplayer_dir.iterdir())
+    except OSError:
+        return []
+
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        m = _PLAYER_MAP_DIR_PATTERN.match(entry.name)
+        if not m:
+            continue
+        steamid, old_server = m.group(1), m.group(2)
+        if old_server == new_server_prefix:
+            continue  # déjà sous le bon nom
+        old_normalized = old_server.replace(" ", "_")
+        if old_normalized != new_normalized:
+            continue  # pas une variante "_"↔" "
+        target = multiplayer_dir / f"{steamid}_{new_server_prefix}_player"
+        if target.exists():
+            continue  # ne pas écraser une cible existante
+        candidates.append((entry, target))
+
+    return candidates
+
+
+def apply_map_orphan_rename(source: Path, target: Path) -> bool:
+    """Renomme un dossier `<steamid>_<OLD>_player/` vers le nouveau Server name.
+
+    Action réversible (os.rename). Retourne True si réussi, False sinon.
+    Refuse si target existe (pour ne pas écraser une vraie map).
+    """
+    if target.exists():
+        return False
+    if not source.exists() or not source.is_dir():
+        return False
+    try:
+        os.rename(source, target)
+        return True
+    except OSError:
+        return False
+
+
+def verify_bundle_integrity(
+    zip_path: Path, progress: "ProgressCb | None" = None,
+) -> tuple[bool, str]:
     """Vérifie le hash SHA256 du bundle contre celui du manifest.
 
     Renvoie (ok, message). Si le manifest n'a pas de champ sha256 (anciens
     bundles v1), renvoie (True, "manifest sans sha256 — vérification ignorée").
+
+    Si `progress` est fourni, il est transmis à `_sha256_of_zip_content` pour
+    update incrémentale de la barre UI pendant la vérification (sinon la barre
+    reste figée 5-15 sec sur les gros bundles).
     """
     try:
         manifest = read_manifest(zip_path)
@@ -707,7 +1040,7 @@ def verify_bundle_integrity(zip_path: Path) -> tuple[bool, str]:
         return False, f"Manifest invalide : {e}"
     if not manifest.sha256:
         return True, "manifest sans sha256 (bundle v1) — vérification ignorée"
-    actual = _sha256_of_zip_content(zip_path)
+    actual = _sha256_of_zip_content(zip_path, progress=progress)
     if actual != manifest.sha256:
         return False, f"Hash SHA256 ne correspond pas (bundle peut-être corrompu pendant la synchro cloud)"
     return True, "hash SHA256 OK"
@@ -719,6 +1052,7 @@ def extract_bundle(
     backup_dir: Path | None = None,
     verify_hash: bool = True,
     allow_no_backup: bool = False,
+    progress: "ProgressCb | None" = None,
 ) -> ExtractReport:
     """Extrait un bundle dans la bonne arborescence Zomboid du destinataire.
 
@@ -772,7 +1106,7 @@ def extract_bundle(
             )
 
     if verify_hash:
-        ok, msg = verify_bundle_integrity(zip_path)
+        ok, msg = verify_bundle_integrity(zip_path, progress=progress)
         if not ok:
             raise ValueError(
                 f"Bundle corrompu : {msg}. "
@@ -806,6 +1140,49 @@ def extract_bundle(
             if f.exists():
                 shutil.copy2(f, backed_up_to / f.name)
 
+    # ---- Dispatch selon le mode du bundle ----
+    if manifest.bundle_mode == "diff":
+        extracted_db, extracted_server = _extract_diff_overlay(
+            zip_path, manifest, save_dir, db_path, server_dir, root,
+        )
+    else:
+        extracted_db, extracted_server = _extract_full_replace(
+            zip_path, manifest, save_dir, db_path, server_dir, root,
+        )
+
+    # Détection map orphan : si Server name change (ex: passage v0.3.x ↔ v0.4.0
+    # avec fix preservation), proposer renommage du `<steamid>_<OLD>_player/`
+    # local pour préserver la mini-map M révélée.
+    new_server_prefix = manifest.inferred_server_prefix or save_name
+    try:
+        map_orphans = detect_orphan_player_map_dirs(new_server_prefix, root=root)
+    except Exception:
+        map_orphans = []
+
+    return ExtractReport(
+        save_name=save_name,
+        save_dir=save_dir,
+        db_path=extracted_db,
+        server_files=extracted_server,
+        backed_up_to=backed_up_to,
+        mods=list(manifest.mods),
+        workshop_items=list(manifest.workshop_items),
+        map_orphan_candidates=map_orphans,
+    )
+
+
+def _extract_full_replace(
+    zip_path: Path,
+    manifest: BundleManifest,
+    save_dir: Path,
+    db_path: Path,
+    server_dir: Path,
+    root: Path,
+) -> tuple[Path | None, list[Path]]:
+    """Mode FULL (v0.3.x) : on efface save_dir + on extrait tout.
+
+    Comportement inchangé depuis v0.3.7 — chemin testé en production.
+    """
     # ---- Effacement de l'ancien save_dir ----
     if save_dir.exists():
         shutil.rmtree(save_dir)
@@ -857,15 +1234,102 @@ def extract_bundle(
                 extracted_server.append(target)
             # else: fichier hors structure attendue → ignoré silencieusement
 
-    return ExtractReport(
-        save_name=save_name,
-        save_dir=save_dir,
-        db_path=extracted_db,
-        server_files=extracted_server,
-        backed_up_to=backed_up_to,
-        mods=list(manifest.mods),
-        workshop_items=list(manifest.workshop_items),
-    )
+    return extracted_db, extracted_server
+
+
+def _extract_diff_overlay(
+    zip_path: Path,
+    manifest: BundleManifest,
+    save_dir: Path,
+    db_path: Path,
+    server_dir: Path,
+    root: Path,
+) -> tuple[Path | None, list[Path]]:
+    """Mode DIFF : overlay sur la save existante, sans wiper.
+
+    Comportement :
+    - NE PAS rmtree(save_dir) — les fichiers locaux non listés sont préservés.
+    - Pour chaque fichier sous save/ dans le zip → écrasement atomique sur place.
+    - On ne touche PAS à db/<save>.db* (cache local hôte = source de vérité).
+    - On ne touche PAS à Server/<save>.* (config serveur hôte = source de vérité).
+    - Suppressions (manifest.deleted_files) : ignorées en v0.4.0 (toujours [] côté push).
+    - Validation post-overlay : compare hash local vs expected_save_files,
+      log warning si divergence (n'avorte pas — l'hôte peut avoir des fichiers
+      légitimes hors snapshot du client).
+
+    Retourne (None, []) — un diff n'apporte ni db, ni server files.
+    """
+    # Crée save_dir si absent (cas hôte qui pull son premier diff sur une save
+    # déjà drop ; rare mais possible)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in zf.namelist():
+            if name == MANIFEST_FILENAME:
+                continue
+            if name.endswith("/"):
+                continue
+            posix = name.replace("\\", "/")
+
+            if posix.startswith("save/"):
+                rel = posix[len("save/"):]
+                target = _safe_join(save_dir, rel)
+                _atomic_extract_file(zf, name, target)
+            # On IGNORE db/ et server/ même s'ils sont présents par accident
+            # (un client malformé pourrait les inclure ; on respecte la promesse
+            # diff = save uniquement)
+
+    # Suppressions explicites (v0.4.0 toujours vide, mais déjà câblé pour v0.5)
+    for rel in manifest.deleted_files:
+        try:
+            target = _safe_join(save_dir, rel)
+        except ValueError:
+            continue
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                _log.warning("Overlay : suppression %s a échoué", target)
+
+    # Validation post-overlay (best-effort, n'avorte pas)
+    divergences = _validate_overlay_state(save_dir, manifest.expected_save_files)
+    if divergences:
+        _log.warning(
+            "Overlay : %d fichier(s) ont un hash inattendu après extraction "
+            "(possiblement modifs locales de l'hôte non capturées par le client)",
+            len(divergences),
+        )
+
+    return None, []
+
+
+def _validate_overlay_state(save_dir: Path, expected: dict[str, str]) -> list[str]:
+    """Compare le hash local des fichiers attendus à celui du manifest.
+
+    Retourne la liste des chemins divergents (manquants ou hash différent).
+    Ne hashe que les fichiers déclarés dans `expected` — un fichier local hors
+    expected est légitime (l'hôte peut avoir des fichiers que le client n'avait
+    pas reçus initialement).
+    """
+    divergences: list[str] = []
+    for rel, expected_sha in expected.items():
+        target = save_dir / rel
+        if not target.exists():
+            divergences.append(rel)
+            continue
+        try:
+            h = hashlib.sha256()
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            if h.hexdigest() != expected_sha:
+                divergences.append(rel)
+        except OSError:
+            divergences.append(rel)
+    return divergences
 
 
 def _format_mods_summary(mods: list[str], workshop_items: list[str]) -> list[str]:

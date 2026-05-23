@@ -76,6 +76,9 @@ class Config:
     auto_check_updates: bool = True
     last_update_check: str = ""
     hide_help_banner: bool = False  # mémorise si l'user a fermé la bannière d'aide
+    # v0.4.0 — bundle différentiel
+    diff_mode_default: bool = True  # toggle "Envoi optimisé" coché par défaut
+    diff_keep_snapshots: int = 5  # nb de snapshots gardés par save lors du GC
 
     # ---- Accès au profil actif (compat API v0.2) ----
     @property
@@ -251,6 +254,8 @@ def save(cfg: Config) -> None:
         "auto_check_updates": cfg.auto_check_updates,
         "last_update_check": cfg.last_update_check,
         "hide_help_banner": cfg.hide_help_banner,
+        "diff_mode_default": cfg.diff_mode_default,
+        "diff_keep_snapshots": cfg.diff_keep_snapshots,
     }
     payload = json.dumps(data, indent=2)
     tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")

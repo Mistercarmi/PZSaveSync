@@ -166,9 +166,19 @@ def test_discover_cross_verifies_db_against_server_prefix(tmp_path):
     assert cf.db is not None and cf.db.name == "servertest.db"
 
 
-def test_build_bundle_renames_inferred_files(tmp_path):
-    """Quand on bundle avec server_prefix différent, les fichiers serveur
-    apparaissent dans le zip sous {save_name}.ext."""
+def test_build_bundle_preserves_server_prefix_in_filenames(tmp_path):
+    """v0.4.0 fix bug map M : les fichiers server gardent leur nom d'origine
+    dans le zip (plus de renommage sous save_name).
+
+    Raison : PZ indexe le dossier `<steamid>_<Server name>_player/` (qui
+    contient la mini-map M révélée) par le Server name lu dans le .ini.
+    Si on renomme `servertest.ini` → `MaSave.ini`, le destinataire lance PZ
+    avec Server name = "MaSave" → son fog of war (sous "servertest") devient
+    orphelin → map perdue après un round-trip push/pull.
+
+    La DB reste renommée sous save_name (cache local destinataire, sans
+    impact sur le fog of war côté PZ).
+    """
     _make_layout(tmp_path, "MaSave", server_prefix="servertest")
     out = tmp_path / "bundle.zip"
     m = bundle_mod.build_bundle(
@@ -176,20 +186,22 @@ def test_build_bundle_renames_inferred_files(tmp_path):
     )
     assert m.has_db is True
     assert m.inferred_server_prefix == "servertest"
+    # server_files = noms ORIGINAUX (pas renommés)
     assert set(m.server_files) == {
-        "MaSave.ini",
-        "MaSave_SandboxVars.lua",
-        "MaSave_spawnregions.lua",
+        "servertest.ini",
+        "servertest_SandboxVars.lua",
+        "servertest_spawnregions.lua",
     }
     with zipfile.ZipFile(out, "r") as zf:
         names = set(zf.namelist())
+    # DB toujours renommée sous save_name (logique cache client)
     assert "db/MaSave.db" in names
-    assert "server/MaSave.ini" in names
-    assert "server/MaSave_SandboxVars.lua" in names
-    assert "server/MaSave_spawnregions.lua" in names
-    # L'ancien nom n'apparaît PAS
-    assert "server/servertest.ini" not in names
-    assert "db/servertest.db" not in names
+    # Server files sous nom d'origine
+    assert "server/servertest.ini" in names
+    assert "server/servertest_SandboxVars.lua" in names
+    assert "server/servertest_spawnregions.lua" in names
+    # Le nom save_name n'apparaît PAS dans server/
+    assert "server/MaSave.ini" not in names
 
 
 def test_build_bundle_exact_match_no_inference_recorded(tmp_path):
@@ -200,9 +212,73 @@ def test_build_bundle_exact_match_no_inference_recorded(tmp_path):
     assert m.inferred_server_prefix == ""
 
 
-def test_extract_bundle_with_renamed_files_works_end_to_end(tmp_path):
-    """Build avec servertest.* → extract dans une autre root → fichiers sous
-    le bon nom côté destinataire."""
+def test_build_bundle_preserves_server_name_with_spaces(tmp_path):
+    """Cas réel du bug map M perdue : Server name avec ESPACES "Gitano Z"
+    + World name avec underscores "Gitano_Z".
+
+    Avant fix (v0.3.x) : le bundle renommait "Gitano Z.ini" → "Gitano_Z.ini"
+    à l'embarquement, écrasant le Server name au destinataire. Au reload PZ,
+    le dossier `<steamid>_Gitano Z_player/` (qui contient le fog of war) devenait
+    orphelin car PZ cherchait maintenant `<steamid>_Gitano_Z_player/`.
+
+    Après fix (v0.4.0) : le Server name "Gitano Z" est préservé, le destinataire
+    le restaure tel quel, son fog of war reste accessible.
+    """
+    _make_layout(tmp_path, "Gitano_Z", server_prefix="Gitano Z")
+    out = tmp_path / "bundle.zip"
+    m = bundle_mod.build_bundle("Gitano_Z", out, "patito", root=tmp_path)
+
+    # Le manifest pointe vers le prefix réel
+    assert m.inferred_server_prefix == "Gitano Z"
+    # Les server_files conservent les espaces
+    assert "Gitano Z.ini" in m.server_files
+    assert "Gitano Z_SandboxVars.lua" in m.server_files
+
+    with zipfile.ZipFile(out, "r") as zf:
+        names = set(zf.namelist())
+    assert "server/Gitano Z.ini" in names
+    assert "server/Gitano_Z.ini" not in names  # PAS de underscore
+
+
+def test_extract_bundle_with_spaces_roundtrip(tmp_path):
+    """Roundtrip complet : Patito (espaces) push → Isaac extract → Isaac play
+    → Isaac push → Patito extract → le Server name "Gitano Z" est préservé
+    des deux côtés, donc les fog of war restent valides.
+    """
+    # Patito : Server name = "Gitano Z" (espaces), World = "Gitano_Z"
+    patito_root = tmp_path / "patito"
+    patito_root.mkdir()
+    _make_layout(patito_root, "Gitano_Z", server_prefix="Gitano Z")
+    seed_zip = tmp_path / "seed.zip"
+    bundle_mod.build_bundle("Gitano_Z", seed_zip, "patito", root=patito_root)
+
+    # Isaac : extract → reçoit Server/Gitano Z.ini (espaces conservés)
+    isaac_root = tmp_path / "isaac"
+    isaac_root.mkdir()
+    bundle_mod.extract_bundle(
+        seed_zip, root=isaac_root, verify_hash=True, allow_no_backup=True,
+    )
+    assert (isaac_root / "Server" / "Gitano Z.ini").exists()
+    assert not (isaac_root / "Server" / "Gitano_Z.ini").exists()
+
+    # Isaac joue, push retour → bundle d'Isaac
+    (isaac_root / "Saves" / "Multiplayer" / "Gitano_Z" / "new_chunk.bin").write_bytes(b"explored")
+    isaac_zip = tmp_path / "isaac.zip"
+    bundle_mod.build_bundle("Gitano_Z", isaac_zip, "isaac", root=isaac_root)
+
+    # Patito pull bundle d'Isaac → Server/Gitano Z.ini intact
+    bundle_mod.extract_bundle(
+        isaac_zip, root=patito_root, verify_hash=True, allow_no_backup=True,
+    )
+    assert (patito_root / "Server" / "Gitano Z.ini").exists()
+    assert not (patito_root / "Server" / "Gitano_Z.ini").exists()
+
+
+def test_extract_bundle_preserves_server_prefix_end_to_end(tmp_path):
+    """v0.4.0 : Build avec servertest.* → extract dans une autre root → les
+    fichiers server sont restaurés sous leur nom d'origine (servertest.*),
+    pour préserver le fog of war côté destinataire.
+    """
     src_root = tmp_path / "src_root"
     src_root.mkdir()
     _make_layout(src_root, "MaSave", server_prefix="servertest")
@@ -215,11 +291,16 @@ def test_extract_bundle_with_renamed_files_works_end_to_end(tmp_path):
         out, root=dest_root, verify_hash=True, allow_no_backup=True,
     )
     assert report.save_name == "MaSave"
+    # save_dir restaurée sous save_name
     assert (dest_root / "Saves" / "Multiplayer" / "MaSave" / "map_0_0.bin").exists()
+    # DB sous save_name (cache local)
     assert (dest_root / "db" / "MaSave.db").exists()
-    assert (dest_root / "Server" / "MaSave.ini").exists()
-    assert (dest_root / "Server" / "MaSave_SandboxVars.lua").exists()
-    assert (dest_root / "Server" / "MaSave_spawnregions.lua").exists()
+    # Server files sous nom d'origine (préservation Server name)
+    assert (dest_root / "Server" / "servertest.ini").exists()
+    assert (dest_root / "Server" / "servertest_SandboxVars.lua").exists()
+    assert (dest_root / "Server" / "servertest_spawnregions.lua").exists()
+    # NE PAS avoir renommé sous save_name
+    assert not (dest_root / "Server" / "MaSave.ini").exists()
 
 
 def test_discover_underscore_to_space_variant(tmp_path):

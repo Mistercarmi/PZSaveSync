@@ -3,6 +3,131 @@
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versioning
 sémantique ([SemVer](https://semver.org/lang/fr/)).
 
+## [0.4.0] — 2026-05-24
+
+### Fixed — perte de la mini-map M après push/pull (CRITIQUE, signalé en v0.3.7)
+
+- **Les fichiers `Server/<save>.ini` étaient renommés sous `save_name`** lors du
+  bundling, écrasant le Server name d'origine. Au reload PZ chez le destinataire,
+  PZ utilisait alors le nouveau Server name (typiquement underscoré) pour
+  retrouver le dossier `Saves/Multiplayer/<steamid>_<Server name>_player/`
+  (qui contient la mini-map M révélée). Mais le dossier local était sous
+  l'ancien Server name (avec espaces) → **PZ créait un nouveau dossier vide
+  et perdait la map**.
+- **Reproduction** : Patito héberge "Gitano Z" (espaces) → push → Isaac extract →
+  Isaac lance PZ avec Server name "Gitano_Z" (underscore) → joue → push retour →
+  Patito extract → relance PZ avec Server name "Gitano_Z" (underscore) → son
+  fog of war `<patito_steamid>_Gitano Z_player/` devient orphelin → **map
+  perdue côté Patito**. Le bug touchait les deux joueurs après un round-trip.
+- **Fix 1** : les fichiers server gardent leur **nom d'origine** dans le bundle
+  (pas de renommage sous save_name). Le destinataire restaure sous le bon
+  Server name → son fog of war local reste accessible. La DB reste renommée
+  sous save_name (cache local sans impact sur le fog of war).
+- **Fix 2** : à l'import, **détection automatique** des dossiers
+  `<steamid>_<OLD>_player/` orphelins (variante "_"↔" " du nouveau Server name).
+  L'app propose à l'utilisateur un **renommage 1-clic** : "🗺  Maps révélées
+  à mettre à jour — Le Server name de cette save a changé. Sans renommage, PZ
+  ne retrouvera pas la mini-map M révélée. Renommer maintenant ?"
+- **+15 tests** dédiés au cas espaces/underscores et au renommage map orphan.
+
+### Fixed — barre de progression bloquée pendant la vérification SHA256
+
+- **Sur les gros bundles** (52k+ fichiers, 64 MB), la prog bar restait figée
+  à 0/1 pendant 5-15 sec pendant le hash, donnant l'impression d'un freeze.
+- **Fix** : `_sha256_of_zip_content` et `verify_bundle_integrity` acceptent
+  désormais un `ProgressCb` qui update toutes les 50 entrées traitées.
+  L'utilisateur voit maintenant "verify 5000/52000... 12000/52000..." au lieu
+  d'un bouton "bloqué".
+
+### Added — Bundle différentiel ⚡ (réduction 95-98% des push retour)
+
+- **Nouveau mode "Envoi optimisé"** activé par défaut dans le dialog Push.
+  Au lieu de renvoyer le bundle complet (~64 MB sur une save type), on n'envoie
+  que les fichiers modifiés/ajoutés depuis le dernier import (~1-3 MB).
+  Mesure empirique sur 2 zips réels Gitano_Z (52k fichiers, 168 MB décompressé) :
+  - 51,357 fichiers identiques entre hôte et client après une session = inutiles
+  - 1,370 fichiers modifiés + 328 nouveaux = 0.2 MB + 0.9 MB = ~1.1 MB
+  - **Gain : 98% (64 MB → 1.1 MB)**
+
+- **Toggle "Envoi optimisé" dans PushOptionsDialog** (coché par défaut, configurable
+  via `cfg.diff_mode_default`). Décocher = mode FULL failsafe garanti.
+
+- **Snapshot SHA256 post-import** (`src/pzsavesync/snapshot.py`) : à chaque
+  pull/import réussi, on hash chaque fichier de la save extraite et on persiste
+  ce snapshot dans `~/PZSaveSync/snapshots/<save>__<sha>.json`. Au prochain push,
+  on diffe l'état courant contre ce snapshot → on n'inclut que les divergences.
+
+- **Format Bundle v4** : nouveaux champs dans `BundleManifest` (`bundle_mode`,
+  `parent_bundle_sha256`, `expected_save_files`, `diff_files`, `deleted_files`,
+  `excluded_categories`). Compat ascendante v3 garantie : les anciens bundles
+  s'extraient toujours en mode FULL automatiquement.
+
+- **Overlay côté hôte au pull** : un bundle diff fait un overlay sur la save
+  existante (pas wipe + extract). Les fichiers locaux non listés dans le diff
+  sont **préservés**. Aucun risque de perdre du travail local.
+
+- **Exclusions diff côté client** (l'hôte = source de vérité) :
+  - `db/<save>.db*` : cache SQLite local du client, ne touche pas le .db hôte
+  - `server/<save>.*` : config serveur (Mods, Sandbox, spawnregions) intacte
+  - `WorldDictionaryReadable.lua` + `WorldDictionaryLog.lua` : caches debug
+    régénérés à chaque session (826 KB économisés par push)
+
+- **Détection conflit "parent SHA mismatch"** : si un autre joueur a poussé
+  entre temps, le push diff refuse et propose un pull avant de re-push.
+  Failsafe : bouton "Forcer en mode FULL" disponible dans le dialog.
+
+- **Garde-fou "DiffTooBig"** : si > 85% des fichiers existants non-redondants
+  ont changé, le diff bascule en exception (`DiffTooBigError`) — l'UI peut
+  fallback FULL automatiquement.
+
+### Added — Affichage du gain
+
+- **Indicateur ⚡/📦** à côté de chaque version dans la liste cloud.
+- **Toast post-push** "⚡ Push optimisé envoyé ! X MB au lieu de Y MB (-Z%)"
+  pour montrer le gain réalisé.
+
+### Added — GC automatique des snapshots
+
+- Au startup, `cleanup_orphan_snapshots()` purge les snapshots :
+  - Plus vieux que 180 jours (configurable `MAX_SNAPSHOT_AGE_DAYS`)
+  - Au-delà des N derniers par save (configurable `diff_keep_snapshots=5`)
+- Garde toujours le plus récent par save même si > max_age_days.
+- Best-effort : un échec GC ne bloque jamais le démarrage.
+
+### Tests
+
+- **+70 tests** sur 4 nouveaux fichiers :
+  - `test_snapshot.py` (31 tests) : compute/save/load/diff/GC/orphans/corrupt
+  - `test_bundle_v4.py` (12 tests) : compat v3, manifest validation v4
+  - `test_diff_bundle.py` (16 tests) : roundtrip full→diff→overlay,
+    exclusions (db, server, Lua), too-big-fallback, preserve unlisted, etc.
+  - `test_sync_diff.py` (11 tests) : intégration sync, parent SHA mismatch,
+    snapshot post-pull, PushStats gain ratio
+  - `test_gui_diff_helpers.py` (3 tests) : helpers gui module-level
+- **Compat ascendante** : tous les 173 tests pré-v0.4.0 passent toujours.
+
+### Changed — API
+
+- `SharedRepo.push_bundle()` retourne désormais un **tuple `(Version, PushStats)`**
+  (au lieu de juste `Version`). Les appelants existants (gui + tests) ont été
+  adaptés. PushStats fournit `mode_used`, `gain_ratio`, `actual_size_bytes`,
+  `full_size_estimate_bytes`, etc.
+
+- `Version` dataclass : nouveaux champs `bundle_mode`, `parent_bundle_sha256`,
+  `full_size_estimate_bytes`. Manifestes cloud pré-v0.4.0 → defaults appliqués.
+
+- `BundleManifest` dataclass : champs v4 listés ci-dessus, defaults conservés
+  pour les bundles v3.
+
+### Migration
+
+Pas de migration manuelle nécessaire. Au prochain lancement :
+1. Le config.json existant est étendu avec les 2 nouveaux champs (defaults).
+2. Le manifest cloud existant continue d'être lu (champs v4 défaultés à "full").
+3. Les premiers push depuis v0.4.0 seront FULL (pas de snapshot encore créé).
+4. À partir du premier pull/import sous v0.4.0, un snapshot est créé →
+   les push suivants seront automatiquement DIFF.
+
 ## [0.3.7] — 2026-05-23
 
 ### Fixed — inférence de companions piégée par plusieurs serveurs concurrents

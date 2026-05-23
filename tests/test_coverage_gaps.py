@@ -107,7 +107,7 @@ def test_push_bundle_creates_version_in_manifest(tmp_path):
 
     shared = tmp_path / "shared"
     repo = SharedRepo(shared)
-    version = repo.push_bundle(
+    version, stats = repo.push_bundle(
         save_name="TestSave",
         uploaded_by="alice",
         note="test push",
@@ -118,6 +118,8 @@ def test_push_bundle_creates_version_in_manifest(tmp_path):
     assert version.note == "test push"
     assert version.has_db is True
     assert version.size_bytes > 0
+    assert version.bundle_mode == "full"  # default mode
+    assert stats.mode_used == "full"
     # Le fichier physique existe
     assert (shared / "versions" / version.filename).exists()
     # Le manifest le voit
@@ -163,6 +165,7 @@ def test_push_bundle_appends_not_replaces(tmp_path):
     repo.push_bundle("TestSave", "alice", root=zomboid)
     versions = repo.list_versions()
     assert len(versions) == 2
+    assert all(v.bundle_mode == "full" for v in versions)
 
 
 # -----------------------------------------------------------------------------
@@ -176,7 +179,7 @@ def test_pull_bundle_restores_save(tmp_path):
     _make_minimal_zomboid(zomboid_src)
 
     repo = SharedRepo(tmp_path / "shared")
-    v = repo.push_bundle("TestSave", "alice", root=zomboid_src)
+    v, _stats = repo.push_bundle("TestSave", "alice", root=zomboid_src)
 
     # On simule le côté destinataire avec un répertoire vide via le bundle
     # extract_bundle accepte root=...

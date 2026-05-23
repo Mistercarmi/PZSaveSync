@@ -24,8 +24,11 @@ from pzsavesync import (
     pz_detector,
     restore as restore_mod,
     saves,
+    snapshot as snapshot_mod,
     updater,
 )
+from pzsavesync.bundle import BundleMode
+from pzsavesync.diff_errors import ParentBundleSHAmismatchError
 from pzsavesync.progress_dialog import ProgressDialog
 from pzsavesync.sync import SharedRepo, Version
 from pzsavesync.tooltip import attach as tip
@@ -42,6 +45,70 @@ except ImportError:
 _log = log_mod.get("gui")
 
 LOCAL_BACKUPS = Path.home() / "PZSaveSync_LocalBackups"
+
+
+def _try_create_snapshot_post_import(zip_path: Path, report) -> None:
+    """Crée un snapshot SHA256 après un extract réussi, pour habiliter les
+    futurs push différentiels. Best-effort, ne bloque jamais l'import.
+    """
+    try:
+        manifest = bundle_mod.read_manifest(zip_path)
+        snap = snapshot_mod.compute_snapshot(
+            save_dir=report.save_dir,
+            save_name=report.save_name,
+            parent_sha=manifest.sha256,
+            parent_filename=zip_path.name,
+        )
+        snapshot_mod.save_snapshot(snap)
+        _log.info("Snapshot post-import créé pour %s (parent=%s)",
+                  report.save_name, manifest.sha256[:12])
+    except Exception as e:
+        _log.warning("Snapshot post-import échoué (%s) — push diff indisponible "
+                     "jusqu'à un nouveau pull", e)
+
+
+def _propose_map_orphan_renames(parent, report) -> None:
+    """Si l'import a détecté des `<steamid>_<OLD>_player/` orphelins, propose
+    à l'user de les renommer pour préserver sa mini-map M révélée.
+
+    Sans ce rename, le joueur perdrait sa carte explorée à la prochaine session PZ
+    parce que le Server name a changé entre le push d'origine et l'import actuel
+    (typiquement passage v0.3.x ↔ v0.4.0 avec fix preservation Server name).
+    """
+    candidates = getattr(report, "map_orphan_candidates", None) or []
+    if not candidates:
+        return
+
+    pairs_text = "\n".join(
+        f"   • {src.name}\n     → {dst.name}"
+        for src, dst in candidates
+    )
+    msg = (
+        "🗺  Maps révélées à mettre à jour\n\n"
+        f"Le Server name de cette save a changé. Sans renommage, "
+        f"PZ ne retrouvera pas la mini-map M révélée par {len(candidates)} "
+        f"joueur(s) à la prochaine session.\n\n"
+        f"Renommage(s) proposé(s) :\n{pairs_text}\n\n"
+        "Action réversible. Renommer maintenant ?"
+    )
+    if not messagebox.askyesno("Préserver la map révélée", msg):
+        return
+
+    renamed: list[str] = []
+    failed: list[str] = []
+    for src, dst in candidates:
+        ok = bundle_mod.apply_map_orphan_rename(src, dst)
+        (renamed if ok else failed).append(src.name)
+
+    if renamed:
+        _log.info("Renommage map orphan : %d réussi(s)", len(renamed))
+    if failed:
+        _log.warning("Renommage map orphan : %d échec(s) : %s", len(failed), failed)
+        messagebox.showwarning(
+            "Renommage partiel",
+            f"{len(renamed)} renommage(s) réussi(s), {len(failed)} échec(s) :\n"
+            + "\n".join(failed)
+        )
 
 
 def _open_path(path: Path | str) -> None:
@@ -86,7 +153,7 @@ ACTION_NEUTRAL_HOVER = "#484c54"
 ACTION_DANGER = "#b24545"     # rouge, attention
 ACTION_RELEASE = "#7a5a3a"    # brun chaud (libérer un verrou — sobre, pas dangereux)
 
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.4.0"
 
 
 _AppBase = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND_AVAILABLE else (ctk.CTk,)
@@ -122,6 +189,13 @@ class App(*_AppBase):
 
         # Nettoyage des résidus de la session précédente
         self._cleanup_orphan_tmp()
+        # GC snapshots (best-effort, ne bloque pas le startup)
+        try:
+            snapshot_mod.cleanup_orphan_snapshots(
+                keep_n_recent=getattr(self.cfg, "diff_keep_snapshots", 5),
+            )
+        except Exception as e:
+            _log.warning("GC snapshots échoué (non-bloquant) : %s", e)
 
         self._build_header()
         self._build_tabs()
@@ -271,10 +345,12 @@ class App(*_AppBase):
         self.tabs_widget = tabs
         self.tab_share = tabs.add("🔄  Partager")
         self.tab_parties = tabs.add("🎮  Mes parties")
+        self.tab_backups = tabs.add("💾  Backups")
         self.tab_settings = tabs.add("⚙  Réglages")
 
         self._build_tab_share()
         self._build_tab_parties()
+        self._build_tab_backups()
         self._build_tab_settings()
 
     # ============================================================== TAB PARTAGER
@@ -683,6 +759,241 @@ class App(*_AppBase):
             font=("Segoe UI", 10), justify="left", wraplength=560,
         )
         self.detail_help.pack(fill="x", padx=16, pady=(4, 14))
+
+    # =============================================================== TAB BACKUPS
+    def _build_tab_backups(self):
+        """Onglet Backups : historique complet des backups locaux avec accès direct.
+
+        Chaque pull/import crée un backup automatique pre_import_<save>_<ts>/
+        et chaque restauration crée un backup pre_restore_<save>_<ts>/. Cet
+        onglet expose la liste, le contenu, et 3 actions par backup :
+        📁 Ouvrir le dossier — ↩ Restaurer — 🗑 Supprimer.
+        """
+        wrap = self.tab_backups
+
+        # --- Header avec compteur + actions globales ---
+        header = ctk.CTkFrame(wrap, fg_color=COLOR_CARD, corner_radius=10,
+                              border_width=1, border_color=COLOR_BORDER)
+        header.pack(fill="x", padx=16, pady=(16, 8))
+
+        header_inner = ctk.CTkFrame(header, fg_color="transparent")
+        header_inner.pack(fill="x", padx=14, pady=12)
+
+        left_block = ctk.CTkFrame(header_inner, fg_color="transparent")
+        left_block.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            left_block, text="💾  Historique des backups",
+            font=("Segoe UI", 14, "bold"), anchor="w",
+        ).pack(anchor="w")
+        self.backups_stats_label = ctk.CTkLabel(
+            left_block, text="", font=("Segoe UI", 11),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        )
+        self.backups_stats_label.pack(anchor="w", pady=(4, 0))
+        ctk.CTkLabel(
+            left_block,
+            text=("Backup auto avant chaque pull/import et avant chaque restauration. "
+                  "Tu peux restaurer un état antérieur en 1 clic."),
+            font=("Segoe UI", 9), text_color=COLOR_TEXT_DIM,
+            anchor="w", justify="left", wraplength=900,
+        ).pack(anchor="w", pady=(2, 0))
+
+        right_block = ctk.CTkFrame(header_inner, fg_color="transparent")
+        right_block.pack(side="right")
+        ctk.CTkButton(
+            right_block, text="📁  Ouvrir le dossier", height=32, width=160,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+            command=lambda: _open_path(LOCAL_BACKUPS),
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            right_block, text="🔄  Rafraîchir", height=32, width=120,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+            command=self._refresh_backups,
+        ).pack(side="right", padx=(6, 0))
+
+        # --- Liste scrollable des backups ---
+        self.backups_scroll = ctk.CTkScrollableFrame(
+            wrap, fg_color=COLOR_BG, corner_radius=0,
+        )
+        self.backups_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        # Label "aucun backup" affiché si liste vide
+        self.backups_empty_label = ctk.CTkLabel(
+            self.backups_scroll,
+            text=("Aucun backup pour l'instant.\n\n"
+                  "Un backup sera créé automatiquement à ton prochain pull "
+                  "ou import depuis un .zip."),
+            font=("Segoe UI", 11), text_color=COLOR_TEXT_MUTED,
+            justify="center",
+        )
+        # On le pack/unpack selon le contenu
+
+        self._refresh_backups()
+
+    def _refresh_backups(self):
+        """Reconstruit la liste des cards de backups."""
+        if not hasattr(self, "backups_scroll"):
+            return  # onglet pas encore construit
+
+        # Vider la scrollable frame (sauf le label vide qu'on gère séparément)
+        for child in list(self.backups_scroll.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        LOCAL_BACKUPS.mkdir(parents=True, exist_ok=True)
+        backups = restore_mod.list_backups(LOCAL_BACKUPS)
+
+        # Stats globales
+        total_size = sum(b.size_bytes for b in backups)
+        total_mb = total_size / 1024 / 1024
+        if backups:
+            self.backups_stats_label.configure(
+                text=f"{len(backups)} backup(s) · {total_mb:.1f} MB total · "
+                     f"dossier : {LOCAL_BACKUPS}",
+            )
+        else:
+            self.backups_stats_label.configure(
+                text=f"0 backup · dossier : {LOCAL_BACKUPS}",
+            )
+
+        if not backups:
+            self.backups_empty_label = ctk.CTkLabel(
+                self.backups_scroll,
+                text=("📭  Aucun backup pour l'instant.\n\n"
+                      "Un backup sera créé automatiquement à ton prochain pull "
+                      "ou import depuis un .zip."),
+                font=("Segoe UI", 11), text_color=COLOR_TEXT_MUTED,
+                justify="center",
+            )
+            self.backups_empty_label.pack(pady=40)
+            return
+
+        # Une card par backup
+        for backup in backups:
+            self._build_backup_card(self.backups_scroll, backup)
+
+    def _build_backup_card(self, parent, backup: "restore_mod.BackupEntry"):
+        """Construit une card visuelle pour un backup."""
+        # Couleur de bordure selon le kind
+        border = ACTION_PULL if backup.kind == "import" else COLOR_WARN
+        kind_icon = "⬇" if backup.kind == "import" else "↩"
+        kind_text = "avant import / pull" if backup.kind == "import" else "avant restauration"
+
+        card = ctk.CTkFrame(
+            parent, fg_color=COLOR_CARD, corner_radius=8,
+            border_width=1, border_color=COLOR_BORDER,
+        )
+        card.pack(fill="x", padx=4, pady=5)
+
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=14, pady=10)
+
+        # En-tête : titre (save name + timestamp)
+        header_row = ctk.CTkFrame(inner, fg_color="transparent")
+        header_row.pack(fill="x")
+        ctk.CTkLabel(
+            header_row,
+            text=f"{kind_icon}  {backup.save_name}",
+            font=("Segoe UI", 13, "bold"), anchor="w", text_color=border,
+        ).pack(side="left")
+        size_mb = backup.size_bytes / 1024 / 1024
+        ctk.CTkLabel(
+            header_row, text=f"{size_mb:.1f} MB",
+            font=("Segoe UI", 11), anchor="e", text_color=COLOR_TEXT_MUTED,
+        ).pack(side="right")
+
+        # Sous-titre : date + kind
+        ctk.CTkLabel(
+            inner,
+            text=f"📅  {backup.display_timestamp}   ·   {kind_text}",
+            font=("Segoe UI", 10), anchor="w", text_color=COLOR_TEXT_MUTED,
+        ).pack(fill="x", pady=(2, 4))
+
+        # Contenu du backup
+        content_bits = []
+        if backup.has_save_zip:
+            content_bits.append("🗺  Monde (save.zip)")
+        if backup.has_db:
+            content_bits.append(f"💾  DB {backup.save_name}.db")
+        if backup.db_companions:
+            content_bits.append(f"📂  SQLite WAL : {len(backup.db_companions)}")
+        if backup.server_files:
+            content_bits.append(f"⚙  Config serveur : {len(backup.server_files)}")
+        content_text = "  ·  ".join(content_bits) if content_bits else "(vide)"
+        ctk.CTkLabel(
+            inner, text=content_text,
+            font=("Segoe UI", 10), anchor="w",
+            text_color=COLOR_TEXT if content_bits else COLOR_TEXT_DIM,
+        ).pack(fill="x", pady=(0, 8))
+
+        # Chemin physique (mode debug / pour copier-coller)
+        path_label = ctk.CTkLabel(
+            inner, text=f"📍  {backup.path}",
+            font=("Segoe UI", 9), anchor="w", text_color=COLOR_TEXT_DIM,
+            cursor="hand2",
+        )
+        path_label.pack(fill="x", pady=(0, 8))
+        path_label.bind("<Button-1>", lambda e, p=backup.path: _open_path(p))
+
+        # Boutons d'action
+        actions = ctk.CTkFrame(inner, fg_color="transparent")
+        actions.pack(fill="x")
+        ctk.CTkButton(
+            actions, text="📁  Ouvrir", width=110, height=30,
+            fg_color=ACTION_NEUTRAL, hover_color=ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10),
+            command=lambda p=backup.path: _open_path(p),
+        ).pack(side="left", padx=(0, 6))
+        restore_btn = ctk.CTkButton(
+            actions, text="↩  Restaurer", width=130, height=30,
+            fg_color=ACTION_PUSH if backup.restorable else ACTION_NEUTRAL,
+            hover_color="#3da76b" if backup.restorable else ACTION_NEUTRAL_HOVER,
+            font=("Segoe UI", 10, "bold"),
+            command=lambda b=backup: self._do_restore_backup(b),
+        )
+        restore_btn.pack(side="left", padx=(0, 6))
+        if not backup.restorable:
+            restore_btn.configure(state="disabled")
+            tip(restore_btn, "Pas de save.zip dans ce backup — rien à restaurer.")
+
+        ctk.CTkButton(
+            actions, text="🗑  Supprimer", width=110, height=30,
+            fg_color="#5a3a3a", hover_color="#704646",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT,
+            command=lambda b=backup: self._delete_backup(b),
+        ).pack(side="right")
+
+    def _delete_backup(self, backup: "restore_mod.BackupEntry"):
+        """Supprime un backup local après confirmation."""
+        msg = (
+            f"Supprimer définitivement ce backup ?\n\n"
+            f"Save     : {backup.save_name}\n"
+            f"Date     : {backup.display_timestamp}\n"
+            f"Type     : {backup.kind_label}\n"
+            f"Taille   : {backup.size_bytes / 1024 / 1024:.1f} MB\n"
+            f"Dossier  : {backup.path}\n\n"
+            f"⚠ Action irréversible. Si tu restaures par erreur un autre backup, "
+            f"tu ne pourras plus revenir à cet état."
+        )
+        if not messagebox.askyesno("Supprimer le backup", msg):
+            return
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(backup.path)
+            _log.info("Backup supprimé : %s", backup.path)
+        except Exception as e:
+            _log.error("Suppression backup échouée : %s", e)
+            messagebox.showerror("Suppression", f"Échec : {e}")
+            return
+        notifications.notify(
+            "PZ SaveSync — Backup supprimé",
+            f"{backup.save_name} ({backup.display_timestamp}) supprimé.",
+        )
+        self._refresh_backups()
 
     # ============================================================== TAB RÉGLAGES
     def _build_tab_settings(self):
@@ -1355,6 +1666,12 @@ class App(*_AppBase):
         # Cloud
         self._refresh_cloud()
 
+        # Backups (refresh la liste après import/restore/delete)
+        try:
+            self._refresh_backups()
+        except Exception as e:
+            _log.warning("Refresh backups échoué (non-bloquant) : %s", e)
+
         # Bannière "save en retard"
         self._refresh_late_banner()
 
@@ -1666,13 +1983,20 @@ class App(*_AppBase):
             if not messagebox.askyesno("Verrou",
                                        f"Le tour est à {lock.holder}. Pousser quand même ?"):
                 return
-        # Dialog enrichi : note + checkbox "libérer le tour après"
-        opts = PushOptionsDialog(self, default_release=self.cfg.auto_release_lock)
+        # Dialog enrichi : note + envoi optimisé + checkbox "libérer le tour après"
+        opts = PushOptionsDialog(
+            self,
+            default_release=self.cfg.auto_release_lock,
+            default_diff=getattr(self.cfg, "diff_mode_default", True),
+        )
         self.wait_window(opts)
         if not opts.ok:
             return
         note = opts.note
         release_after = opts.release_after
+        # AUTO : tente DIFF si snapshot dispo, fallback FULL silencieux.
+        # FULL : explicite (failsafe).
+        push_mode = BundleMode.AUTO if opts.use_diff else BundleMode.FULL
 
         # Push en thread avec progress dialog
         dlg = ProgressDialog(self, "Push en cours…")
@@ -1683,12 +2007,26 @@ class App(*_AppBase):
                 uploaded_by=name,
                 note=note,
                 progress=progress_cb,
+                mode=push_mode,
             )
 
-        def on_done(v, err):
+        def on_done(result, err):
             if err:
+                # Cas spécial : un autre joueur a poussé entre temps
+                if isinstance(err, ParentBundleSHAmismatchError):
+                    if messagebox.askyesno(
+                        "Version retardée",
+                        "⚠  Un autre joueur a poussé une nouvelle version depuis "
+                        "ton dernier import.\n\n"
+                        "Tu dois récupérer sa version (pull) avant de re-push.\n\n"
+                        "Pull maintenant ?",
+                    ):
+                        self._pull()
+                    return
                 messagebox.showerror("Push", str(err))
                 return
+            # v0.4.0 : push_bundle retourne (Version, PushStats)
+            v, stats = result
             # Auto-release du tour
             if release_after:
                 try:
@@ -1719,19 +2057,34 @@ class App(*_AppBase):
                     )
                 except Exception:
                     pass
-            messagebox.showinfo(
-                "Push réussi",
-                f"Bundle envoyé : {v.filename}\n"
-                f"Taille : {v.size_bytes/1024/1024:.1f} MB\n"
-                f"DB joueurs : {'oui' if v.has_db else 'NON'}\n"
-                f"Config serveur : {len(v.server_files or [])} fichier(s)"
-                + ("\n🔓 Tour libéré." if release_after else "")
-            )
+            # Affichage du gain si mode diff
+            actual_mb = v.size_bytes / 1024 / 1024
+            if stats.mode_used == "diff" and stats.full_size_estimate_bytes > 0:
+                full_mb = stats.full_size_estimate_bytes / 1024 / 1024
+                gain_pct = stats.gain_ratio * 100
+                title = "⚡  Push optimisé envoyé !"
+                msg = (
+                    f"{actual_mb:.1f} MB au lieu de {full_mb:.0f} MB "
+                    f"(-{gain_pct:.0f}%)\n\n"
+                    f"{stats.files_pushed} fichier(s) modifié(s) envoyé(s).\n"
+                    f"Fichier : {v.filename}"
+                )
+            else:
+                title = "Push réussi"
+                msg = (
+                    f"Bundle complet envoyé : {v.filename}\n"
+                    f"Taille : {actual_mb:.1f} MB\n"
+                    f"DB joueurs : {'oui' if v.has_db else 'NON'}\n"
+                    f"Config serveur : {len(v.server_files or [])} fichier(s)"
+                )
+            if release_after:
+                msg += "\n\n🔓 Tour libéré."
+            messagebox.showinfo(title, msg)
             notifications.notify(
-                "PZ SaveSync — Push OK",
-                f"Bundle {save_name} ({v.size_bytes/1024/1024:.0f} MB) envoyé.",
+                f"PZ SaveSync — Push {'⚡' if stats.mode_used == 'diff' else 'OK'}",
+                f"Bundle {save_name} ({actual_mb:.1f} MB) envoyé.",
             )
-            _log.info("Push OK : %s", v.filename)
+            _log.info("Push %s : %s (%.1f MB)", stats.mode_used, v.filename, actual_mb)
             self.refresh_all()
 
         dlg.run_in_thread(worker, on_done=on_done)
@@ -1778,7 +2131,8 @@ class App(*_AppBase):
         versions = list(reversed(repo.list_versions()))
         for v in versions:
             size_mb = v.size_bytes / (1024 * 1024)
-            line = (f"{v.uploaded_at}  {v.uploaded_by:>10}  "
+            mode_icon = "⚡" if v.bundle_mode == "diff" else "📦"
+            line = (f"{mode_icon} {v.uploaded_at}  {v.uploaded_by:>10}  "
                     f"[{v.save_name:<14}] {size_mb:6.1f} MB  "
                     f"db={'Y' if v.has_db else 'N'}  srv={len(v.server_files or [])}  "
                     f"{v.filename}")
@@ -1873,6 +2227,7 @@ class App(*_AppBase):
                 return
             self._show_extract_report(report, box=self.preview_box)
             self._check_mods_for_report(report)
+            _propose_map_orphan_renames(self, report)
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
@@ -1986,11 +2341,15 @@ class App(*_AppBase):
 
         def worker(progress_cb):
             progress_cb("verify", 0, 1)
-            ok, vmsg = bundle_mod.verify_bundle_integrity(Path(path))
+            ok, vmsg = bundle_mod.verify_bundle_integrity(Path(path), progress=progress_cb)
             if not ok:
                 raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
             progress_cb("verify", 1, 1)
-            return bundle_mod.extract_bundle(Path(path), backup_dir=LOCAL_BACKUPS)
+            report = bundle_mod.extract_bundle(
+                Path(path), backup_dir=LOCAL_BACKUPS, verify_hash=False, progress=progress_cb,
+            )
+            _try_create_snapshot_post_import(Path(path), report)
+            return report
 
         def on_done(report, err):
             if err:
@@ -1999,6 +2358,7 @@ class App(*_AppBase):
             self._show_extract_report(report, box=self.preview_box)
             # Vérif mods installés
             self._check_mods_for_report(report)
+            _propose_map_orphan_renames(self, report)
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
@@ -2138,11 +2498,15 @@ class App(*_AppBase):
 
         def worker(progress_cb):
             progress_cb("verify", 0, 1)
-            ok, vmsg = bundle_mod.verify_bundle_integrity(path)
+            ok, vmsg = bundle_mod.verify_bundle_integrity(path, progress=progress_cb)
             if not ok:
                 raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
             progress_cb("verify", 1, 1)
-            return bundle_mod.extract_bundle(path, backup_dir=LOCAL_BACKUPS)
+            report = bundle_mod.extract_bundle(
+                path, backup_dir=LOCAL_BACKUPS, verify_hash=False, progress=progress_cb,
+            )
+            _try_create_snapshot_post_import(path, report)
+            return report
 
         def on_done(report, err):
             if err:
@@ -2151,6 +2515,7 @@ class App(*_AppBase):
                 return
             self._show_extract_report(report, box=self.preview_box)
             self._check_mods_for_report(report)
+            _propose_map_orphan_renames(self, report)
             self.cfg.save_name = report.save_name
             config.save(self.cfg)
             self.refresh_all()
@@ -2705,24 +3070,25 @@ class BuildWindow(ctk.CTkToplevel):
 
 
 class PushOptionsDialog(ctk.CTkToplevel):
-    """Dialog modal pour les options du push : note + libérer le tour."""
+    """Dialog modal pour les options du push : note + mode + libérer le tour."""
 
-    def __init__(self, parent, default_release: bool = True):
+    def __init__(self, parent, default_release: bool = True, default_diff: bool = True):
         super().__init__(parent)
         self.title("Options du push")
-        self.geometry("480x260")
+        self.geometry("520x380")
         self.configure(fg_color=COLOR_BG)
         self.resizable(False, False)
         self.ok = False
         self.note = ""
         self.release_after = default_release
-        self._build_ui(default_release)
+        self.use_diff = default_diff
+        self._build_ui(default_release, default_diff)
         try:
             self.grab_set()
         except Exception:
             pass
 
-    def _build_ui(self, default_release: bool):
+    def _build_ui(self, default_release: bool, default_diff: bool):
         card = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=10,
                             border_width=1, border_color=COLOR_BORDER)
         card.pack(fill="both", expand=True, padx=14, pady=14)
@@ -2730,7 +3096,7 @@ class PushOptionsDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             card, text="⬆  Push vers le dossier partagé",
             font=("Segoe UI", 13, "bold"), anchor="w",
-        ).pack(fill="x", padx=14, pady=(14, 10))
+        ).pack(fill="x", padx=14, pady=(14, 8))
 
         ctk.CTkLabel(
             card, text="Note pour ton pote (optionnel) :",
@@ -2740,13 +3106,28 @@ class PushOptionsDialog(ctk.CTkToplevel):
         ctk.CTkEntry(
             card, textvariable=self.note_var, height=34,
             placeholder_text="ex. Fini d'explorer la mairie de Muldraugh",
-        ).pack(fill="x", padx=14, pady=(4, 12))
+        ).pack(fill="x", padx=14, pady=(4, 10))
+
+        # ⚡ Envoi optimisé (mode différentiel)
+        diff_frame = ctk.CTkFrame(card, fg_color=COLOR_BG, corner_radius=6)
+        diff_frame.pack(fill="x", padx=14, pady=(0, 8))
+        self.diff_var = ctk.BooleanVar(value=default_diff)
+        ctk.CTkCheckBox(
+            diff_frame, text="⚡  Envoi optimisé  (recommandé)",
+            variable=self.diff_var, font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+        ctk.CTkLabel(
+            diff_frame,
+            text=("N'envoie que les fichiers modifiés depuis ton dernier import.\n"
+                  "Décoche pour un envoi COMPLET (failsafe — plus gros, plus sûr)."),
+            font=("Segoe UI", 9), text_color=COLOR_TEXT_MUTED, justify="left",
+        ).pack(anchor="w", padx=10, pady=(0, 8))
 
         self.release_var = ctk.BooleanVar(value=default_release)
         ctk.CTkCheckBox(
             card, text="🔓  Libérer le tour après le push",
             variable=self.release_var, font=("Segoe UI", 11),
-        ).pack(anchor="w", padx=14, pady=(0, 14))
+        ).pack(anchor="w", padx=14, pady=(0, 12))
 
         btns = ctk.CTkFrame(card, fg_color="transparent")
         btns.pack(fill="x", padx=14, pady=(0, 14))
@@ -2765,6 +3146,7 @@ class PushOptionsDialog(ctk.CTkToplevel):
     def _confirm(self):
         self.note = self.note_var.get().strip()
         self.release_after = bool(self.release_var.get())
+        self.use_diff = bool(self.diff_var.get())
         self.ok = True
         self.destroy()
 

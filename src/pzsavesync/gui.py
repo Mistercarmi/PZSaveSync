@@ -2196,14 +2196,33 @@ class App(*_AppBase):
         if not latest:
             messagebox.showinfo("Pull", "Aucune version disponible dans le dossier partagé.")
             return
+
+        # FIX 2 v0.4.0 — message adapté au mode du bundle.
+        # En mode DIFF, l'overlay NE TOUCHE PAS à db/ ni Server/. Le dialog
+        # précédent disait "écrase db et Server" → user déclinait à tort.
+        if latest.bundle_mode == "diff":
+            mode_label = "⚡  Bundle optimisé (diff)"
+            scope = (
+                f"⚠ Va appliquer un overlay sur :\n"
+                f"   • Zomboid\\Saves\\Multiplayer\\{latest.save_name}\\\n"
+                f"     (fichiers locaux non modifiés par ton pote sont PRÉSERVÉS)\n\n"
+                f"   Zomboid\\db\\{latest.save_name}.db et\n"
+                f"   Zomboid\\Server\\{latest.save_name}.*\n"
+                f"     NE sont PAS modifiés (tes configs locales restent).\n\n"
+            )
+        else:
+            mode_label = "📦  Bundle complet"
+            scope = (
+                f"⚠ Va écraser ces fichiers locaux (backup auto avant) :\n"
+                f"   • Zomboid\\Saves\\Multiplayer\\{latest.save_name}\\\n"
+                f"   • Zomboid\\db\\{latest.save_name}.db\n"
+                f"   • Zomboid\\Server\\{latest.save_name}.* (config serveur)\n\n"
+            )
         msg = (
-            f"Restaurer le bundle [{latest.save_name}]\n"
+            f"Restaurer [{latest.save_name}] — {mode_label}\n"
             f"Fichier : {latest.filename}\n"
             f"Uploadé par {latest.uploaded_by} le {latest.uploaded_at}\n\n"
-            f"⚠ Va écraser ces fichiers locaux (backup auto avant) :\n"
-            f"   • Zomboid\\Saves\\Multiplayer\\{latest.save_name}\\\n"
-            f"   • Zomboid\\db\\{latest.save_name}.db\n"
-            f"   • Zomboid\\Server\\{latest.save_name}.* (config serveur)\n\n"
+            + scope +
             f"Backups dans : {LOCAL_BACKUPS}\n\nContinuer ?"
         )
         if not messagebox.askyesno("Pull", msg):
@@ -2214,11 +2233,12 @@ class App(*_AppBase):
         def worker(progress_cb):
             progress_cb("verify", 0, 1)
             archive = repo.versions_dir / latest.filename
-            ok, vmsg = bundle_mod.verify_bundle_integrity(archive)
+            ok, vmsg = bundle_mod.verify_bundle_integrity(archive, progress=progress_cb)
             if not ok:
                 raise ValueError(f"Vérification d'intégrité échouée : {vmsg}")
             progress_cb("verify", 1, 1)
-            return repo.pull_bundle(latest, backup_dir=LOCAL_BACKUPS)
+            # FIX 8 v0.4.0 — verify_hash=False car déjà fait ci-dessus
+            return repo.pull_bundle(latest, backup_dir=LOCAL_BACKUPS, verify_hash=False)
 
         def on_done(report, err):
             if err:
@@ -3207,7 +3227,41 @@ class CloudPicker(ctk.CTkToplevel):
 
 
 def run():
-    App().mainloop()
+    # FIX 6 v0.4.0 — capture des exceptions non catchées pour diagnostic.
+    # En mode --windowed (pas de console), une exception qui remonte hors d'un
+    # worker disparaît silencieusement. On la log explicitement dans
+    # ~/PZSaveSync/logs/pzsavesync.log pour pouvoir debug en prod.
+    import sys
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        _log.error(
+            "Exception non catchée (thread principal)",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        # Fallback : appeler le hook standard si on est en mode terminal
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _thread_excepthook(args):
+        _log.error(
+            "Exception non catchée (thread %s)",
+            getattr(args, "thread", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _excepthook
+    try:
+        import threading
+        threading.excepthook = _thread_excepthook
+    except Exception:
+        pass
+
+    app = App()
+    # Idem pour les callbacks Tk (events, after, etc.)
+    app.report_callback_exception = lambda exc_type, exc_value, exc_tb: _log.error(
+        "Exception non catchée (callback Tk)",
+        exc_info=(exc_type, exc_value, exc_tb),
+    )
+    app.mainloop()
 
 
 if __name__ == "__main__":

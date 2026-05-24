@@ -13,6 +13,7 @@ from pzsavesync import bundle as bundle_mod  # utilisé dans health_check/adopt_
 from pzsavesync import snapshot as snapshot_mod
 from pzsavesync.bundle import BundleMode
 from pzsavesync.diff_errors import (
+    DiffTooBigError,
     NoSnapshotAvailableError,
     ParentBundleSHAmismatchError,
 )
@@ -457,16 +458,47 @@ class SharedRepo:
         filename = f"bundle_{safe_save}_{ts}_{safe_user}.zip"
         target = self.versions_dir / filename
 
-        manifest = bundle_mod.build_bundle(
-            save_name=save_name,
-            out_zip=target,
-            created_by=uploaded_by,
-            note=note,
-            root=root,
-            progress=progress,
-            mode=actual_mode,
-            parent_snapshot=parent_snapshot,
-        )
+        # Fix v0.4.0 — DiffTooBig fallback : si > 85% des chunks ont changé,
+        # _build_diff_bundle raise DiffTooBigError. En mode AUTO, on retry
+        # silencieusement en FULL. En mode DIFF explicite, on propage l'erreur
+        # au caller (GUI peut afficher un dialog "Diff trop important, FULL ?").
+        try:
+            manifest = bundle_mod.build_bundle(
+                save_name=save_name,
+                out_zip=target,
+                created_by=uploaded_by,
+                note=note,
+                root=root,
+                progress=progress,
+                mode=actual_mode,
+                parent_snapshot=parent_snapshot,
+            )
+        except DiffTooBigError as e:
+            if mode == BundleMode.AUTO:
+                _log.info("DiffTooBig en mode AUTO (%s) — fallback FULL silencieux", e)
+                # Nettoyage : un .tmp peut avoir été laissé par le diff avorté
+                tmp_leftover = target.with_suffix(target.suffix + ".tmp")
+                for leftover in (target, tmp_leftover):
+                    if leftover.exists():
+                        try:
+                            leftover.unlink()
+                        except OSError:
+                            pass
+                actual_mode = BundleMode.FULL
+                parent_snapshot = None
+                manifest = bundle_mod.build_bundle(
+                    save_name=save_name,
+                    out_zip=target,
+                    created_by=uploaded_by,
+                    note=note,
+                    root=root,
+                    progress=progress,
+                    mode=BundleMode.FULL,
+                )
+            else:
+                # Mode DIFF explicite : on propage, le GUI décide (proposer
+                # bascule FULL via une exception typée que l'UI catch).
+                raise
 
         actual_size = target.stat().st_size
 
@@ -556,16 +588,19 @@ class SharedRepo:
 
         return BundleMode.DIFF, snap
 
-    def pull_bundle(self, version: Version, backup_dir: Path):
+    def pull_bundle(self, version: Version, backup_dir: Path, *, verify_hash: bool = True):
         """Restaure le bundle d'une version. Backup automatique de l'existant.
 
         Après extract réussi, calcule un snapshot SHA256 du save_dir local pour
         permettre les futurs push différentiels. Échec snapshot = non-bloquant.
+
+        `verify_hash=False` permet de skip la vérif SHA256 si le caller (GUI)
+        l'a déjà faite — évite un double calcul de 5-30s sur grosse save.
         """
         archive = self.versions_dir / version.filename
         if not archive.exists():
             raise FileNotFoundError(f"Archive manquante : {archive}")
-        report = bundle_mod.extract_bundle(archive, backup_dir=backup_dir)
+        report = bundle_mod.extract_bundle(archive, backup_dir=backup_dir, verify_hash=verify_hash)
 
         # Snapshot post-import (best-effort, ne bloque pas le pull si échoue)
         try:
@@ -645,6 +680,46 @@ class SharedRepo:
             for v in extras:
                 if v not in to_delete:
                     to_delete.append(v)
+
+        # FIX 4 v0.4.0 — protection seed FULL parent de DIFFs :
+        # On ne peut PAS supprimer une version FULL si une version DIFF gardée
+        # référence son sha256 comme parent_bundle_sha256. Sinon le DIFF
+        # devient orphelin et provoque le bug FIX 3 (save corrompue au pull).
+        kept_after_delete = [v for v in in_scope if v not in to_delete]
+        kept_parent_shas = {
+            v.get("parent_bundle_sha256")
+            for v in kept_after_delete
+            if v.get("bundle_mode") == "diff" and v.get("parent_bundle_sha256")
+        }
+        if kept_parent_shas:
+            # Pour chaque candidate FULL à supprimer, lire son SHA et vérifier
+            # qu'aucun DIFF gardé ne le référence.
+            protected: list[dict] = []
+            for v in list(to_delete):
+                if v.get("bundle_mode") != "full":
+                    continue
+                fname = v.get("filename")
+                if not fname:
+                    continue
+                try:
+                    m = bundle_mod.read_manifest(self.versions_dir / fname)
+                    if m.sha256 in kept_parent_shas:
+                        protected.append(v)
+                        to_delete.remove(v)
+                        _log.info(
+                            "prune_versions : protection FULL %s "
+                            "(parent d'au moins 1 DIFF gardé)", fname,
+                        )
+                except Exception as e:
+                    # Si on ne peut pas lire le manifest, par prudence on protège
+                    # (mieux vaut garder une version qu'on ne sait pas analyser
+                    # que risquer de casser la chaîne).
+                    _log.warning(
+                        "prune_versions : impossible de lire manifest de %s (%s), "
+                        "version protégée par sécurité", fname, e,
+                    )
+                    protected.append(v)
+                    to_delete.remove(v)
 
         # Effacer physiquement + mettre à jour le manifest
         deleted_filenames: list[str] = []

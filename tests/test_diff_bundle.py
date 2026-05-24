@@ -17,6 +17,7 @@ from pzsavesync.bundle import BundleMode
 from pzsavesync.diff_errors import (
     DiffTooBigError,
     NoSnapshotAvailableError,
+    OrphanDiffError,
 )
 from pzsavesync.snapshot import compute_snapshot
 
@@ -284,8 +285,11 @@ def test_overlay_does_not_touch_server_config(tmp_path):
     assert (host_root / "Server" / "S_SandboxVars.lua").read_text(encoding="utf-8") == "HostSandbox=1"
 
 
-def test_overlay_creates_save_dir_if_missing(tmp_path):
-    """Si la save_dir hôte n'existe pas (cas edge), overlay la crée et y dépose les fichiers."""
+def test_overlay_refuses_on_missing_save_dir(tmp_path):
+    """v0.4.0 FIX 3 : un overlay sur save_dir absente serait corrompu (le diff
+    seul ne suffit pas à reconstruire la save). Désormais on raise OrphanDiffError
+    pour éviter la save partielle silencieuse.
+    """
     host_root = tmp_path / "host"
     host_root.mkdir()
 
@@ -298,13 +302,10 @@ def test_overlay_creates_save_dir_if_missing(tmp_path):
         "S", diff_zip, "client", root=client_root, mode=BundleMode.DIFF, parent_snapshot=snap,
     )
 
-    bundle_mod.extract_bundle(
-        diff_zip, root=host_root, verify_hash=True, allow_no_backup=True,
-    )
-
-    target = host_root / "Saves" / "Multiplayer" / "S" / "new.bin"
-    assert target.exists()
-    assert target.read_bytes() == b"y"
+    with pytest.raises(OrphanDiffError):
+        bundle_mod.extract_bundle(
+            diff_zip, root=host_root, verify_hash=True, allow_no_backup=True,
+        )
 
 
 # --------- Roundtrip complet ---------
@@ -438,6 +439,94 @@ def test_overlay_validation_logs_warning_on_divergence(tmp_path, caplog):
 
 
 # --------- Empty diff edge case ---------
+
+# --------- FIX 3 : refus pull DIFF orphelin (seed FULL absent) ---------
+
+def test_extract_diff_bundle_orphan_raises(tmp_path):
+    """v0.4.0 FIX 3 : pull d'un DIFF sans seed FULL local → OrphanDiffError."""
+    # Setup : créer un bundle DIFF (avec snapshot fictif)
+    src_root = tmp_path / "src"
+    src_save = _make_save_with_files(src_root, "Orphan", {
+        "a.bin": b"v1", "b.bin": b"v1", "c.bin": b"v1",
+    })
+    snap = compute_snapshot(src_save, "Orphan", "parent_sha", "src.zip")
+    # Modifier 1 fichier → diff valide
+    (src_save / "a.bin").write_bytes(b"v2")
+    diff_zip = tmp_path / "diff.zip"
+    bundle_mod.build_bundle(
+        "Orphan", diff_zip, "src", root=src_root,
+        mode=BundleMode.DIFF, parent_snapshot=snap,
+    )
+
+    # Destinataire FRESH (pas de seed FULL extrait préalablement)
+    fresh_root = tmp_path / "fresh"
+    fresh_root.mkdir()
+
+    with pytest.raises(OrphanDiffError, match="seed FULL"):
+        bundle_mod.extract_bundle(
+            diff_zip, root=fresh_root, verify_hash=True, allow_no_backup=True,
+        )
+
+
+def test_extract_diff_bundle_with_seed_succeeds(tmp_path):
+    """Sanity : si le seed FULL est extrait au préalable, le DIFF passe."""
+    src_root = tmp_path / "src"
+    src_save = _make_save_with_files(src_root, "Seeded", {
+        "a.bin": b"v1", "b.bin": b"v1", "c.bin": b"v1",
+    })
+
+    # Push full puis pull chez le dst
+    full_zip = tmp_path / "full.zip"
+    bundle_mod.build_bundle("Seeded", full_zip, "src", root=src_root)
+
+    dst_root = tmp_path / "dst"
+    dst_root.mkdir()
+    bundle_mod.extract_bundle(
+        full_zip, root=dst_root, verify_hash=True, allow_no_backup=True,
+    )
+
+    # Maintenant le seed est extrait chez dst. Faisons un diff côté src et pull chez dst.
+    snap = compute_snapshot(src_save, "Seeded", "parent_sha", "src.zip")
+    (src_save / "a.bin").write_bytes(b"v2")
+    diff_zip = tmp_path / "diff.zip"
+    bundle_mod.build_bundle(
+        "Seeded", diff_zip, "src", root=src_root,
+        mode=BundleMode.DIFF, parent_snapshot=snap,
+    )
+
+    # Le pull DIFF doit passer (seed local présent)
+    report = bundle_mod.extract_bundle(
+        diff_zip, root=dst_root, verify_hash=True, allow_no_backup=True,
+    )
+    assert report.save_name == "Seeded"
+
+
+def test_extract_diff_bundle_partial_seed_raises(tmp_path):
+    """Si la save locale n'a qu'un sous-ensemble du seed (< 50% overlap) → orphan."""
+    # Source avec 10 fichiers
+    src_root = tmp_path / "src"
+    src_save = _make_save_with_files(src_root, "Partial", {
+        f"chunk_{i}.bin": b"data" for i in range(10)
+    })
+    snap = compute_snapshot(src_save, "Partial", "parent_sha", "src.zip")
+    (src_save / "chunk_0.bin").write_bytes(b"modified")
+    diff_zip = tmp_path / "diff.zip"
+    bundle_mod.build_bundle(
+        "Partial", diff_zip, "src", root=src_root,
+        mode=BundleMode.DIFF, parent_snapshot=snap,
+    )
+
+    # Destinataire avec seulement 3/10 fichiers du seed (30% < 50%)
+    dst_root = tmp_path / "dst"
+    dst_save = _make_save_with_files(dst_root, "Partial", {
+        "chunk_0.bin": b"data", "chunk_1.bin": b"data", "chunk_2.bin": b"data",
+    })
+
+    with pytest.raises(OrphanDiffError):
+        bundle_mod.extract_bundle(
+            diff_zip, root=dst_root, verify_hash=True, allow_no_backup=True,
+        )
+
 
 def test_diff_bundle_with_no_changes_is_valid(tmp_path):
     """Diff sans changement → bundle valide avec diff_files vide."""

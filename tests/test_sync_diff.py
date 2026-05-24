@@ -11,6 +11,7 @@ from pzsavesync import bundle as bundle_mod
 from pzsavesync import snapshot as snap_mod
 from pzsavesync.bundle import BundleMode
 from pzsavesync.diff_errors import (
+    DiffTooBigError,
     NoSnapshotAvailableError,
     ParentBundleSHAmismatchError,
 )
@@ -240,7 +241,170 @@ def test_push_stats_gain_ratio_for_diff(tmp_path, monkeypatch):
     assert stats.gain_ratio > 0.5  # économie significative attendue
 
 
+# --------- FIX 1 : DiffTooBig fallback FULL en mode AUTO ---------
+
+def test_push_auto_fallbacks_full_when_diff_too_big(tmp_path, monkeypatch):
+    """v0.4.0 FIX 1 : si > 85% des chunks ont changé, mode AUTO doit
+    fallback silencieusement en FULL, pas crasher.
+    """
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    # Push seed initial
+    v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
+
+    bob_zomboid = tmp_path / "bob"
+    bob_zomboid.mkdir()
+    monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    repo.pull_bundle(v1, backup_dir=tmp_path / "bob_backups")
+
+    # Bob modifie 100% des fichiers (situation type "sandbox refresh complet")
+    bob_save = bob_zomboid / "Saves" / "Multiplayer" / "TestSave"
+    for f in bob_save.rglob("*"):
+        if f.is_file():
+            f.write_bytes(b"completely-different-content-" + f.name.encode())
+
+    # Push en mode AUTO : doit fallback FULL silencieusement (sans crash)
+    v_bob, stats = repo.push_bundle(
+        "TestSave", "bob", root=bob_zomboid, mode=BundleMode.AUTO,
+    )
+    assert v_bob.bundle_mode == "full", \
+        f"AUTO devrait fallback en FULL, pas {v_bob.bundle_mode}"
+    assert stats.mode_used == "full"
+
+
+def test_push_diff_explicit_propagates_diff_too_big(tmp_path, monkeypatch):
+    """En mode DIFF explicite, DiffTooBigError est propagée (UI décide)."""
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
+
+    bob_zomboid = tmp_path / "bob"
+    bob_zomboid.mkdir()
+    monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    repo.pull_bundle(v1, backup_dir=tmp_path / "bob_backups")
+
+    bob_save = bob_zomboid / "Saves" / "Multiplayer" / "TestSave"
+    for f in bob_save.rglob("*"):
+        if f.is_file():
+            f.write_bytes(b"completely-different-" + f.name.encode())
+
+    with pytest.raises(DiffTooBigError):
+        repo.push_bundle("TestSave", "bob", root=bob_zomboid, mode=BundleMode.DIFF)
+
+
+def test_push_auto_no_leftover_after_diff_fallback(tmp_path, monkeypatch):
+    """Le retry FULL ne laisse pas de .tmp orphelin du diff avorté."""
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
+
+    bob_zomboid = tmp_path / "bob"
+    bob_zomboid.mkdir()
+    monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    repo.pull_bundle(v1, backup_dir=tmp_path / "bob_backups")
+
+    bob_save = bob_zomboid / "Saves" / "Multiplayer" / "TestSave"
+    for f in bob_save.rglob("*"):
+        if f.is_file():
+            f.write_bytes(b"big-change-" + f.name.encode())
+
+    v_bob, _ = repo.push_bundle("TestSave", "bob", root=bob_zomboid, mode=BundleMode.AUTO)
+
+    # Aucun .tmp ne doit rester dans versions/
+    tmps = list(repo.versions_dir.glob("*.tmp"))
+    assert tmps == [], f"Fichiers .tmp orphelins après fallback : {tmps}"
+
+
 # --------- Version sérialisation backward compat ---------
+
+# --------- FIX 4 : prune_versions protège le FULL parent de DIFFs ---------
+
+def test_prune_versions_protects_full_parent_of_diff(tmp_path, monkeypatch):
+    """v0.4.0 FIX 4 : si keep_last_n=2 garde 2 DIFFs, le FULL parent reste
+    protégé même s'il serait censé être supprimé (sinon bug FIX 3).
+    """
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    # Push FULL v1
+    v1_full, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
+    assert v1_full.bundle_mode == "full"
+
+    # Bob pull → snapshot créé
+    bob_zomboid = tmp_path / "bob"
+    bob_zomboid.mkdir()
+    monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    repo.pull_bundle(v1_full, backup_dir=tmp_path / "bob_backups")
+
+    # Bob push 2 DIFFs (avec petites modifs)
+    import time
+    bob_save = bob_zomboid / "Saves" / "Multiplayer" / "TestSave"
+    (bob_save / "map_0_0.bin").write_bytes(b"modif-1")
+    time.sleep(1.1)
+    v2_diff, _ = repo.push_bundle(
+        "TestSave", "bob", root=bob_zomboid, mode=BundleMode.AUTO,
+    )
+    assert v2_diff.bundle_mode == "diff"
+
+    (bob_save / "map_1_1.bin").write_bytes(b"modif-2")
+    time.sleep(1.1)
+    # Forcer un push DIFF (mode AUTO) — mais ça va échouer car parent SHA mismatch
+    # Donc on adapte : on doit re-pull pour avoir un nouveau snapshot, ou pousser
+    # un FULL et garder le test simple. Simplifions : forcer build via le mode.
+    # En fait, simplifier : 3 versions total dont 1 FULL + 2 DIFF.
+    # Pour cette 2e diff il faut un snapshot à jour. Pull la v2.
+    repo.pull_bundle(v2_diff, backup_dir=tmp_path / "bob_backups")
+    (bob_save / "map_1_1.bin").write_bytes(b"modif-3")
+    v3_diff, _ = repo.push_bundle(
+        "TestSave", "bob", root=bob_zomboid, mode=BundleMode.AUTO,
+    )
+    # v3 peut être full ou diff selon les conditions, l'important c'est qu'on ait
+    # au moins une version qui pointe v1_full comme parent.
+
+    versions_before = repo.list_versions()
+    assert len(versions_before) == 3
+
+    # Tentative de prune keep_last_n=2 (devrait supprimer v1, mais v2 le référence)
+    deleted = repo.prune_versions(keep_last_n=2, save_name="TestSave")
+
+    versions_after = repo.list_versions()
+    # Le FULL v1 doit être protégé car au moins un DIFF kept le référence
+    filenames_after = [v.filename for v in versions_after]
+    if v2_diff.parent_bundle_sha256 or v3_diff.parent_bundle_sha256:
+        # Au moins un DIFF référence v1_full → v1_full doit être préservé
+        assert v1_full.filename in filenames_after, \
+            "v1_full devrait être protégé car parent d'un DIFF gardé"
+
+
+def test_prune_versions_can_delete_full_with_no_diff_children(tmp_path, monkeypatch):
+    """Si aucun DIFF ne référence un FULL, prune peut le supprimer normalement."""
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    # Push 3 FULLs successifs (mode FULL forcé, donc pas de parent_sha)
+    import time
+    versions = []
+    for i in range(3):
+        if i > 0:
+            time.sleep(1.1)
+        v, _ = repo.push_bundle(
+            f"TestSave", f"user{i}", root=src_zomboid, mode=BundleMode.FULL,
+        )
+        assert v.bundle_mode == "full"
+        versions.append(v)
+
+    # prune keep_last_n=2 doit supprimer le 1er
+    deleted = repo.prune_versions(keep_last_n=2, save_name="TestSave")
+    assert versions[0].filename in deleted
+
 
 def test_old_manifest_without_v4_fields_still_loads(tmp_path):
     """Un manifest.json sans bundle_mode (cloud pré-v0.4) doit se charger sans erreur."""

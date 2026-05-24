@@ -37,7 +37,15 @@ from pzsavesync.diff_errors import (
     DiffTooBigError,
     InvalidDiffManifestError,
     NoSnapshotAvailableError,
+    OrphanDiffError,
 )
+
+
+# FIX 3 v0.4.0 — seuil minimum d'overlap entre fichiers locaux et
+# expected_save_files du manifest pour qu'un pull DIFF soit considéré comme
+# légitime (le seed FULL parent est bien là). En dessous, on refuse pour ne
+# pas créer une save partielle corrompue.
+DIFF_ORPHAN_MIN_OVERLAP_RATIO = 0.5
 
 
 MANIFEST_FILENAME = "bundle_manifest.json"
@@ -1118,32 +1126,70 @@ def extract_bundle(
     db_path = root / "db" / f"{save_name}.db"
     server_dir = root / "Server"
 
+    # FIX 3 v0.4.0 — refus pull DIFF orphelin :
+    # Si on extrait un bundle DIFF sans avoir un seed FULL local au préalable,
+    # l'overlay ne déposerait que les fichiers modifiés sur du vide → save
+    # partielle corrompue, mais l'app retournerait "succès" silencieusement.
+    # On vérifie qu'au moins DIFF_ORPHAN_MIN_OVERLAP_RATIO des fichiers
+    # expected_save_files du manifest existent localement.
+    if manifest.bundle_mode == "diff" and manifest.expected_save_files:
+        expected_count = len(manifest.expected_save_files)
+        local_overlap = 0
+        if save_dir.exists():
+            expected_keys = set(manifest.expected_save_files.keys())
+            local_files = set()
+            for f in save_dir.rglob("*"):
+                if f.is_file():
+                    try:
+                        local_files.add(f.relative_to(save_dir).as_posix())
+                    except ValueError:
+                        continue
+            local_overlap = len(local_files & expected_keys)
+        ratio = local_overlap / expected_count if expected_count else 0.0
+        if ratio < DIFF_ORPHAN_MIN_OVERLAP_RATIO:
+            raise OrphanDiffError(
+                f"Ce bundle est un DIFF mais le seed FULL parent semble absent "
+                f"localement ({local_overlap}/{expected_count} fichiers attendus "
+                f"présents, soit {ratio:.0%} < {DIFF_ORPHAN_MIN_OVERLAP_RATIO:.0%}). "
+                f"Demande à l'hôte de re-pousser un bundle COMPLET (toggle "
+                f"'Envoi optimisé' DÉCOCHÉ) avant que tu pulles."
+            )
+
     # ---- Backup ----
     backed_up_to: Path | None = None
     if backup_dir is not None:
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         backed_up_to = backup_dir / f"pre_import_{save_name}_{ts}"
         backed_up_to.mkdir(parents=True, exist_ok=True)
+
+        # FIX 5 v0.4.0 — backup les fichiers Server/DB sous LEUR NOM REEL,
+        # pas sous f"{save_name}.<ext>". Sinon, si l'hôte a "Gitano Z.ini"
+        # (avec espace) et save_name="Gitano_Z" (avec underscore), le backup
+        # rate les fichiers Server → rollback impossible. Frère caché du bug
+        # v0.3.7 corrigé pour le bundle, restait à corriger pour le backup.
+        cf_local = discover_companion_files(save_name, root)
+
         if save_dir.exists():
             shutil.make_archive(
                 str(backed_up_to / "save"), "zip", root_dir=save_dir,
             )
-        if db_path.exists():
-            shutil.copy2(db_path, backed_up_to / db_path.name)
-        # Backup des compagnons SQLite (.db-wal/.db-shm/.db-journal)
-        for sfx in _DB_COMPANION_SUFFIXES:
-            comp = db_path.with_name(db_path.name + sfx)
+        # DB principale (peut être sous un prefix différent de save_name)
+        if cf_local.db is not None and cf_local.db.exists():
+            shutil.copy2(cf_local.db, backed_up_to / cf_local.db.name)
+        # Compagnons SQLite (.db-wal/.db-shm/.db-journal)
+        for comp in cf_local.db_companions:
             if comp.exists():
                 shutil.copy2(comp, backed_up_to / comp.name)
-        for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua"):
-            f = server_dir / f"{save_name}{suffix}"
-            if f.exists():
-                shutil.copy2(f, backed_up_to / f.name)
+        # Fichiers Server sous leur nom RÉEL (espaces préservés)
+        for srv in cf_local.server_files:
+            if srv.exists():
+                shutil.copy2(srv, backed_up_to / srv.name)
 
     # ---- Dispatch selon le mode du bundle ----
     if manifest.bundle_mode == "diff":
         extracted_db, extracted_server = _extract_diff_overlay(
             zip_path, manifest, save_dir, db_path, server_dir, root,
+            progress=progress,
         )
     else:
         extracted_db, extracted_server = _extract_full_replace(
@@ -1244,6 +1290,7 @@ def _extract_diff_overlay(
     db_path: Path,
     server_dir: Path,
     root: Path,
+    progress: "ProgressCb | None" = None,
 ) -> tuple[Path | None, list[Path]]:
     """Mode DIFF : overlay sur la save existante, sans wiper.
 
@@ -1292,43 +1339,58 @@ def _extract_diff_overlay(
                 _log.warning("Overlay : suppression %s a échoué", target)
 
     # Validation post-overlay (best-effort, n'avorte pas)
-    divergences = _validate_overlay_state(save_dir, manifest.expected_save_files)
+    divergences = _validate_overlay_state(
+        save_dir, manifest.expected_save_files, progress=progress,
+    )
     if divergences:
+        sample = divergences[:5]
         _log.warning(
             "Overlay : %d fichier(s) ont un hash inattendu après extraction "
-            "(possiblement modifs locales de l'hôte non capturées par le client)",
-            len(divergences),
+            "(possiblement modifs locales de l'hôte non capturées par le client). "
+            "Exemple(s) : %s",
+            len(divergences), sample,
         )
 
     return None, []
 
 
-def _validate_overlay_state(save_dir: Path, expected: dict[str, str]) -> list[str]:
+def _validate_overlay_state(
+    save_dir: Path,
+    expected: dict[str, str],
+    progress: "ProgressCb | None" = None,
+) -> list[str]:
     """Compare le hash local des fichiers attendus à celui du manifest.
 
     Retourne la liste des chemins divergents (manquants ou hash différent).
     Ne hashe que les fichiers déclarés dans `expected` — un fichier local hors
     expected est légitime (l'hôte peut avoir des fichiers que le client n'avait
     pas reçus initialement).
+
+    FIX 7 v0.4.0 : `progress` permet d'éviter le freeze UI 5-15s sur grosse save.
+    Update toutes les 50 entrées hashées.
     """
     divergences: list[str] = []
-    for rel, expected_sha in expected.items():
+    items = list(expected.items())
+    total = len(items)
+    for i, (rel, expected_sha) in enumerate(items):
         target = save_dir / rel
         if not target.exists():
             divergences.append(rel)
-            continue
-        try:
-            h = hashlib.sha256()
-            with target.open("rb") as f:
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-            if h.hexdigest() != expected_sha:
+        else:
+            try:
+                h = hashlib.sha256()
+                with target.open("rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                if h.hexdigest() != expected_sha:
+                    divergences.append(rel)
+            except OSError:
                 divergences.append(rel)
-        except OSError:
-            divergences.append(rel)
+        if progress and (i % 50 == 0 or i == total - 1):
+            progress("validate", i + 1, total)
     return divergences
 
 

@@ -46,3 +46,12 @@ class SnapshotCorruptError(DiffBundleError):
 class InvalidDiffManifestError(DiffBundleError):
     """Manifest d'un bundle déclare bundle_mode='diff' mais champs requis manquants
     (parent_bundle_sha256 vide ou expected_save_files vide)."""
+
+
+class OrphanDiffError(DiffBundleError):
+    """Bundle diff dont le seed FULL parent n'est plus accessible localement.
+
+    Si on extrait un diff sans avoir le seed FULL au préalable, on écrirait
+    les fichiers du diff sur une save_dir vide ou partielle → save corrompue
+    silencieusement. On refuse explicitement avec un message UX clair.
+    """

@@ -122,6 +122,98 @@ def test_spawnpoints_inferred_when_server_name_differs(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# FIX 5 v0.4.0 — backup pre-import préserve les fichiers Server avec espaces
+# -----------------------------------------------------------------------------
+
+def test_pre_import_backup_preserves_server_files_with_spaces(tmp_path):
+    """v0.4.0 FIX 5 (frère caché du bug v0.3.7) : le backup pre-import doit
+    contenir les fichiers Server avec leur nom d'origine (espaces) — pas
+    f"{save_name}.<ext>" hardcodé.
+
+    Sans ce fix : si Server name = "Gitano Z" (espace) et save_name =
+    "Gitano_Z" (underscore), le backup pre-import contient juste save.zip,
+    pas le .ini ni les Lua → rollback impossible en cas d'incident.
+    """
+    save_name = "Gitano_Z"
+    server_prefix = "Gitano Z"  # avec espace, simulant le Server name PZ
+
+    # Setup local : save_dir + db + server avec ESPACES
+    save_dir = tmp_path / "Saves" / "Multiplayer" / save_name
+    save_dir.mkdir(parents=True)
+    (save_dir / "map_0_0.bin").write_bytes(b"chunk")
+    (tmp_path / "db").mkdir()
+    (tmp_path / "db" / f"{server_prefix}.db").write_bytes(b"db-bytes")
+    (tmp_path / "Server").mkdir()
+    (tmp_path / "Server" / f"{server_prefix}.ini").write_text(
+        "Mods=mod_a\nWorkshopItems=12345\n", encoding="utf-8",
+    )
+    (tmp_path / "Server" / f"{server_prefix}_SandboxVars.lua").write_text(
+        "vars=true", encoding="utf-8",
+    )
+    (tmp_path / "Server" / f"{server_prefix}_spawnregions.lua").write_text(
+        "spawn=muldraugh", encoding="utf-8",
+    )
+
+    import os
+    import time
+    now = time.time()
+    os.utime(save_dir, (now, now))
+    for p in (tmp_path / "Server").iterdir():
+        os.utime(p, (now, now))
+
+    # Build un bundle de la save locale puis l'extraire ailleurs pour
+    # déclencher le pre-import backup
+    bundle_zip = tmp_path / "bundle.zip"
+    bundle_mod.build_bundle(save_name, bundle_zip, "alice", root=tmp_path)
+
+    # Maintenant on extrait dans un autre root, mais cette même root a aussi
+    # une save préalable (sinon pas de backup à faire). Donc on prepare la
+    # target avec une save existante.
+    target_root = tmp_path / "target"
+    target_save_dir = target_root / "Saves" / "Multiplayer" / save_name
+    target_save_dir.mkdir(parents=True)
+    (target_save_dir / "old_chunk.bin").write_bytes(b"old")
+    (target_root / "db").mkdir()
+    (target_root / "db" / f"{server_prefix}.db").write_bytes(b"old-db")
+    (target_root / "Server").mkdir()
+    (target_root / "Server" / f"{server_prefix}.ini").write_text(
+        "OldConfig=true", encoding="utf-8",
+    )
+    (target_root / "Server" / f"{server_prefix}_SandboxVars.lua").write_text(
+        "OldSandbox=true", encoding="utf-8",
+    )
+    (target_root / "Server" / f"{server_prefix}_spawnregions.lua").write_text(
+        "OldSpawn=true", encoding="utf-8",
+    )
+
+    backup_dir = tmp_path / "backups"
+    report = bundle_mod.extract_bundle(
+        bundle_zip, root=target_root, backup_dir=backup_dir,
+    )
+
+    # Le backup pre-import doit contenir les fichiers AVEC ESPACES (nom réel)
+    assert report.backed_up_to is not None
+    assert report.backed_up_to.exists()
+    backup_files = {f.name for f in report.backed_up_to.iterdir() if f.is_file()}
+
+    # save.zip toujours là
+    assert "save.zip" in backup_files
+    # DB avec espaces (vérification CRITIQUE pour le rollback)
+    assert f"{server_prefix}.db" in backup_files, \
+        f"DB avec espaces manquante dans backup ! Trouvé : {backup_files}"
+    # Server files avec espaces
+    assert f"{server_prefix}.ini" in backup_files, \
+        f".ini avec espaces manquant ! Trouvé : {backup_files}"
+    assert f"{server_prefix}_SandboxVars.lua" in backup_files
+    assert f"{server_prefix}_spawnregions.lua" in backup_files
+
+    # Le contenu des backups doit être l'ANCIEN (pas le nouveau)
+    backup_ini = (report.backed_up_to / f"{server_prefix}.ini").read_text(encoding="utf-8")
+    assert "OldConfig=true" in backup_ini, \
+        "Le backup contient le nouveau contenu, pas l'ancien — rollback inutile"
+
+
+# -----------------------------------------------------------------------------
 # Fix #3 — SQLite WAL/SHM/journal
 # -----------------------------------------------------------------------------
 

@@ -6,6 +6,16 @@ Cette release introduit le **bundle différentiel** : au lieu de renvoyer toute 
 - 🗺  **Plus de perte de la mini-map M** après un push/pull (le Server name était écrasé, le fog of war devenait orphelin).
 - ⏳ **Plus de barre "bloquée" pendant la vérification SHA256** (la prog bar update maintenant toutes les 50 entrées).
 
+**+ 8 fixes pré-prod identifiés par audit complet du code** :
+- ✅ `DiffTooBigError` → fallback FULL silencieux (plus de crash si > 85% chunks modifiés)
+- ✅ Dialog `_pull` adapté au mode du bundle (plus de mensonge "va écraser ta config")
+- ✅ Refus explicite des pull DIFF orphelins (plus de save corrompue silencieuse)
+- ✅ `prune_versions` protège les seed FULL parents de DIFFs gardés
+- ✅ **Backup pré-import préserve le Server name avec espaces** (frère caché du bug v0.3.7 — sans ça, rollback impossible)
+- ✅ `sys.excepthook` global → exceptions tracées dans le log même en mode --windowed
+- ✅ Progress callback dans la validation overlay (plus de freeze 5-15s sur grosse save)
+- ✅ Double SHA256 supprimé au pull (gain 5-30s sur 64 MB)
+
 ### 📥 Installation rapide
 
 Télécharge **`PZSaveSync.exe`** ci-dessous, double-clique pour remplacer ton ancienne version. Ta config, tes profils et ton historique cloud sont conservés.

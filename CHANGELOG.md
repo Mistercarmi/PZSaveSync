@@ -5,6 +5,24 @@ sémantique ([SemVer](https://semver.org/lang/fr/)).
 
 ## [0.4.0] — 2026-05-24
 
+### Hardening pré-prod — 8 fixes critiques additionnels (audit pré-release)
+
+Un double audit (code review + audit stabilité) a identifié 8 bugs latents à fixer avant que la v0.4.0 parte en prod, pour ne pas reproduire les pertes de données silencieuses qui ont émaillé les versions précédentes.
+
+**Bugs critiques fixés** :
+- **FIX 1** : `DiffTooBigError` n'était jamais catchée — le mode AUTO crashait en remontant une exception brute à l'UI au lieu de fallback FULL. Désormais : retry silencieux en FULL si > 85% des chunks ont changé.
+- **FIX 2** : le dialog de confirmation `_pull` mentait quand le bundle était en mode DIFF (annonçait l'écrasement de `db/` et `Server/` alors que l'overlay ne les touche pas). Message adapté au mode.
+- **FIX 3** : pull d'un DIFF orphelin (sans seed FULL accessible localement) → save corrompue silencieusement. Désormais : `OrphanDiffError` raise explicite si < 50% des fichiers attendus présents localement, avec message "demande à l'hôte de re-pousser un bundle COMPLET".
+- **FIX 4** : `prune_versions(keep_last_n=2)` pouvait supprimer le seed FULL si 2 DIFFs ultérieurs étaient gardés → chaîne brisée + bug FIX 3 garanti au prochain pull. Désormais : tout FULL parent d'au moins un DIFF gardé est automatiquement protégé du prune.
+- **FIX 5** : **frère caché du bug v0.3.7** — le backup pré-import hardcodait `f"{save_name}.<ext>"` (avec underscore), donc ratait les fichiers Server avec espaces (ex: "Gitano Z.ini"). Si extract crashait à mi-course, rollback impossible. Désormais : backup via `discover_companion_files`, préserve le nom d'origine. Idem pour `restore_backup` et `list_backups` (scan par extension).
+
+**UX hardening** :
+- **FIX 6** : `sys.excepthook` + `threading.excepthook` + `app.report_callback_exception` globaux. Toute exception non catchée est désormais loggée dans `~/PZSaveSync/logs/pzsavesync.log` (avant : invisible en mode `--windowed` console=False).
+- **FIX 7** : `_validate_overlay_state` rehash 100% des fichiers post-overlay sans progress callback → freeze UI 5-15s sur grosse save. Désormais : update toutes les 50 entrées + log les 5 premiers chemins divergents pour debug.
+- **FIX 8** : `verify_bundle_integrity` était appelée 2× au pull (GUI puis `extract_bundle` interne) → double SHA256 5-30s perdues sur grosse save. Désormais : `pull_bundle(verify_hash=False)` quand le caller a déjà fait la vérif.
+
+**+12 tests** dédiés aux 8 fixes. Suite totale : **240 tests verts**.
+
 ### Fixed — perte de la mini-map M après push/pull (CRITIQUE, signalé en v0.3.7)
 
 - **Les fichiers `Server/<save>.ini` étaient renommés sous `save_name`** lors du

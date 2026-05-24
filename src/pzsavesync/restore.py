@@ -59,8 +59,18 @@ class BackupEntry:
         return "avant import" if self.kind == "import" else "avant restauration"
 
 
+_SERVER_SUFFIXES = (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua")
+_DB_COMPANION_SUFFIXES_REL = ("-wal", "-shm", "-journal")
+
+
 def list_backups(backup_root: Path) -> list[BackupEntry]:
-    """Liste les backups disponibles, triés du plus récent au plus ancien."""
+    """Liste les backups disponibles, triés du plus récent au plus ancien.
+
+    v0.4.0 FIX 5 : la détection des fichiers Server/DB ne hardcode plus
+    f"{save_name}.<ext>" — elle scanne les patterns d'extension. Permet
+    de reconnaître les fichiers avec espaces (ex: "Gitano Z.ini") que le
+    fix v0.3.7 préserve maintenant.
+    """
     if not backup_root.exists():
         return []
     out: list[BackupEntry] = []
@@ -87,16 +97,15 @@ def list_backups(backup_root: Path) -> list[BackupEntry]:
             n = f.name
             if n == "save.zip":
                 be.has_save_zip = True
-            elif n == f"{be.save_name}.db":
-                be.has_db = True
-            elif n.startswith(f"{be.save_name}.db-"):
-                be.db_companions.append(n)
-            elif n.startswith(f"{be.save_name}") and (
-                n.endswith(".ini")
-                or n.endswith("_SandboxVars.lua")
-                or n.endswith("_spawnregions.lua")
-                or n.endswith("_spawnpoints.lua")
+            elif n.endswith(".db") and not any(
+                n.endswith(".db" + sfx) for sfx in _DB_COMPANION_SUFFIXES_REL
             ):
+                # Pour rétro-compat, on flag has_db si on trouve UN .db
+                # principal. Le restore lira tout .db trouvé.
+                be.has_db = True
+            elif any(n.endswith(".db" + sfx) for sfx in _DB_COMPANION_SUFFIXES_REL):
+                be.db_companions.append(n)
+            elif any(n.endswith(sfx) for sfx in _SERVER_SUFFIXES):
                 be.server_files.append(n)
         be.size_bytes = size
         out.append(be)
@@ -144,39 +153,45 @@ def restore_backup(
     save_name = backup.save_name
     bundle_mod._validate_save_name(save_name)
     save_dir = root / "Saves" / "Multiplayer" / save_name
-    db_path = root / "db" / f"{save_name}.db"
     server_dir = root / "Server"
+    db_dir = root / "db"
+
+    # FIX 5 v0.4.0 — pre-restore et restore utilisent les fichiers REELLEMENT
+    # présents (par scan d'extension), pas un nom hardcodé f"{save_name}.<ext>".
+    # Permet de gérer les Server name avec espaces ("Gitano Z.ini").
 
     # --- 1. Pre-restore safety backup (de l'état actuel) ---
+    cf_local = bundle_mod.discover_companion_files(save_name, root)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     pre = safety_backup_dir / f"pre_restore_{save_name}_{ts}"
     pre.mkdir(parents=True, exist_ok=True)
     if save_dir.exists():
         shutil.make_archive(str(pre / "save"), "zip", root_dir=save_dir)
-    if db_path.exists():
-        shutil.copy2(db_path, pre / db_path.name)
-    for sfx in bundle_mod._DB_COMPANION_SUFFIXES:
-        comp = db_path.with_name(db_path.name + sfx)
+    if cf_local.db is not None and cf_local.db.exists():
+        shutil.copy2(cf_local.db, pre / cf_local.db.name)
+    for comp in cf_local.db_companions:
         if comp.exists():
             shutil.copy2(comp, pre / comp.name)
-    for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua"):
-        f = server_dir / f"{save_name}{suffix}"
-        if f.exists():
-            shutil.copy2(f, pre / f.name)
+    for srv in cf_local.server_files:
+        if srv.exists():
+            shutil.copy2(srv, pre / srv.name)
 
     # --- 2. Effacement de la save_dir actuelle + compagnons SQLite résiduels ---
     if save_dir.exists():
         shutil.rmtree(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     server_dir.mkdir(parents=True, exist_ok=True)
-    (root / "db").mkdir(parents=True, exist_ok=True)
-    for sfx in bundle_mod._DB_COMPANION_SUFFIXES:
-        stale = db_path.with_name(db_path.name + sfx)
-        if stale.exists():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+    db_dir.mkdir(parents=True, exist_ok=True)
+    # Nettoyer les compagnons SQLite résiduels de l'ancien .db (peu importe son
+    # prefix — on cherche tout .db-* dans db_dir matchant le cf_local.db).
+    if cf_local.db is not None:
+        for sfx in bundle_mod._DB_COMPANION_SUFFIXES:
+            stale = cf_local.db.with_name(cf_local.db.name + sfx)
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
 
     # --- 3. Extraction du save.zip dans save_dir ---
     save_zip = backup.path / "save.zip"
@@ -187,27 +202,36 @@ def restore_backup(
             target = bundle_mod._safe_join(save_dir, name)
             bundle_mod._atomic_extract_file(zf, name, target)
 
-    # --- 4. Restauration db + compagnons ---
+    # --- 4. Restauration db + compagnons (par scan d'extension, pas par nom) ---
     restored_db: Path | None = None
     restored_db_comps: list[Path] = []
-    src_db = backup.path / f"{save_name}.db"
-    if src_db.exists():
-        shutil.copy2(src_db, db_path)
-        restored_db = db_path
-        for sfx in bundle_mod._DB_COMPANION_SUFFIXES:
-            src_comp = backup.path / f"{save_name}.db{sfx}"
-            if src_comp.exists():
-                dst_comp = db_path.with_name(db_path.name + sfx)
-                shutil.copy2(src_comp, dst_comp)
-                restored_db_comps.append(dst_comp)
+    for f in backup.path.iterdir():
+        if not f.is_file():
+            continue
+        n = f.name
+        # DB principale : *.db sans suffixe -wal/-shm/-journal
+        if n.endswith(".db") and not any(
+            n.endswith(".db" + sfx) for sfx in bundle_mod._DB_COMPANION_SUFFIXES
+        ):
+            dst = db_dir / n
+            shutil.copy2(f, dst)
+            if restored_db is None:
+                restored_db = dst
+        # Compagnons SQLite
+        elif any(n.endswith(".db" + sfx) for sfx in bundle_mod._DB_COMPANION_SUFFIXES):
+            dst = db_dir / n
+            shutil.copy2(f, dst)
+            restored_db_comps.append(dst)
 
-    # --- 5. Restauration fichiers Server ---
+    # --- 5. Restauration fichiers Server (par scan d'extension) ---
     restored_server: list[Path] = []
-    for suffix in (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua"):
-        src = backup.path / f"{save_name}{suffix}"
-        if src.exists():
-            dst = server_dir / src.name
-            shutil.copy2(src, dst)
+    server_suffixes = (".ini", "_SandboxVars.lua", "_spawnregions.lua", "_spawnpoints.lua")
+    for f in backup.path.iterdir():
+        if not f.is_file():
+            continue
+        if any(f.name.endswith(sfx) for sfx in server_suffixes):
+            dst = server_dir / f.name
+            shutil.copy2(f, dst)
             restored_server.append(dst)
 
     return RestoreReport(

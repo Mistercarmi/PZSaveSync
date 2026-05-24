@@ -26,6 +26,19 @@ def isolated_app_dir(tmp_path_factory, monkeypatch):
     return fake
 
 
+def _use_app_dir(monkeypatch, path: Path) -> None:
+    """Bascule APP_DIR pour simuler un autre utilisateur (machine distincte).
+
+    Depuis v0.5.x, le push crée aussi un snapshot post-push (pour habiliter le
+    DIFF au prochain push sans pull intermédiaire). Donc tester un scénario
+    Alice+Bob suppose des APP_DIR séparés — sinon Alice "voit" le snapshot
+    fraîchement créé par Bob et vice-versa, ce qui ne reflète pas la réalité
+    (deux machines, deux dossiers locaux).
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(snap_mod, "APP_DIR", path)
+
+
 def _make_minimal_zomboid(root: Path, save_name: str = "TestSave"):
     """Crée un faux Zomboid minimal avec une save jouable."""
     save_dir = root / "Saves" / "Multiplayer" / save_name
@@ -161,18 +174,23 @@ def test_push_bundle_diff_detects_parent_sha_mismatch(tmp_path, monkeypatch):
     src_zomboid = tmp_path / "src"
     _make_minimal_zomboid(src_zomboid)
     repo = SharedRepo(tmp_path / "shared")
+    alice_app = tmp_path / "alice_app"
+    bob_app = tmp_path / "bob_app"
 
-    # 1. Alice push v1 (seed)
+    # 1. Alice push v1 (seed) — dans son APP_DIR
+    _use_app_dir(monkeypatch, alice_app)
     v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
 
-    # 2. Bob pull v1 → snapshot créé pour v1
+    # 2. Bob pull v1 → snapshot créé pour v1 (dans SON APP_DIR)
     bob_zomboid = tmp_path / "bob"
     bob_zomboid.mkdir()
     monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    _use_app_dir(monkeypatch, bob_app)
     repo.pull_bundle(v1, backup_dir=tmp_path / "bob_backups")
 
     # 3. Alice push v2 (en cachette — modifie un fichier de sa save d'abord)
     monkeypatch.delenv("PZ_ZOMBOID_ROOT", raising=False)
+    _use_app_dir(monkeypatch, alice_app)
     (src_zomboid / "Saves" / "Multiplayer" / "TestSave" / "map_1_1.bin").write_bytes(b"alice-update")
     import time
     time.sleep(1.1)  # timestamp distinct
@@ -180,6 +198,7 @@ def test_push_bundle_diff_detects_parent_sha_mismatch(tmp_path, monkeypatch):
 
     # 4. Bob essaie de push un diff → il référence v1 mais latest est v2 → mismatch
     monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    _use_app_dir(monkeypatch, bob_app)
     (bob_zomboid / "Saves" / "Multiplayer" / "TestSave" / "new_chunk.bin").write_bytes(b"bob-new")
     with pytest.raises(ParentBundleSHAmismatchError, match="autre joueur"):
         repo.push_bundle("TestSave", "bob", root=bob_zomboid, mode=BundleMode.DIFF)
@@ -190,16 +209,21 @@ def test_push_bundle_auto_silent_fallback_on_sha_mismatch(tmp_path, monkeypatch)
     src_zomboid = tmp_path / "src"
     _make_minimal_zomboid(src_zomboid)
     repo = SharedRepo(tmp_path / "shared")
+    alice_app = tmp_path / "alice_app"
+    bob_app = tmp_path / "bob_app"
 
+    _use_app_dir(monkeypatch, alice_app)
     v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid)
 
     bob_zomboid = tmp_path / "bob"
     bob_zomboid.mkdir()
     monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    _use_app_dir(monkeypatch, bob_app)
     repo.pull_bundle(v1, backup_dir=tmp_path / "bob_backups")
 
     # Alice push v2 derrière son dos
     monkeypatch.delenv("PZ_ZOMBOID_ROOT", raising=False)
+    _use_app_dir(monkeypatch, alice_app)
     (src_zomboid / "Saves" / "Multiplayer" / "TestSave" / "map_1_1.bin").write_bytes(b"alice-update")
     import time
     time.sleep(1.1)
@@ -207,10 +231,93 @@ def test_push_bundle_auto_silent_fallback_on_sha_mismatch(tmp_path, monkeypatch)
 
     # Bob push en AUTO → fallback FULL silencieux (pas d'exception)
     monkeypatch.setenv("PZ_ZOMBOID_ROOT", str(bob_zomboid))
+    _use_app_dir(monkeypatch, bob_app)
     (bob_zomboid / "Saves" / "Multiplayer" / "TestSave" / "new_chunk.bin").write_bytes(b"bob")
     v_bob, stats = repo.push_bundle("TestSave", "bob", root=bob_zomboid, mode=BundleMode.AUTO)
     assert v_bob.bundle_mode == "full"
     assert stats.mode_used == "full"
+
+
+# --------- Snapshot post-push (v0.5.x) ---------
+
+def test_push_creates_snapshot_to_enable_next_diff(tmp_path):
+    """v0.5.x : un push (FULL ou DIFF) crée un snapshot post-push, pour que
+    l'hôte initial puisse faire DIFF dès son 2e push sans avoir à pull.
+    """
+    zomboid = tmp_path / "zomboid"
+    _make_minimal_zomboid(zomboid)
+    repo = SharedRepo(tmp_path / "shared")
+
+    # 1er push FULL — snapshot doit être créé post-push
+    v1, _ = repo.push_bundle("TestSave", "alice", root=zomboid)
+    snap = snap_mod.find_latest_snapshot_for_save("TestSave")
+    assert snap is not None, "snapshot post-push manquant"
+    assert snap.parent_bundle_filename == v1.filename
+    assert snap.parent_bundle_sha256  # non-vide
+    assert snap.save_files  # contient des hashes
+
+
+def test_host_second_push_uses_diff_without_pull(tmp_path):
+    """v0.5.x : l'hôte qui pousse, joue, repush voit son 2e push devenir DIFF
+    automatiquement grâce au snapshot post-push (avant ça il restait FULL).
+    """
+    zomboid = tmp_path / "zomboid"
+    _make_minimal_zomboid(zomboid)
+    # Beaucoup de chunks pour rendre le gain mesurable
+    for i in range(20):
+        (zomboid / "Saves" / "Multiplayer" / "TestSave" / f"map_{i}_{i}.bin").write_bytes(
+            b"x" * 1024
+        )
+    repo = SharedRepo(tmp_path / "shared")
+
+    # Push 1 (FULL forcé car aucun snapshot pré-existant)
+    v1, stats1 = repo.push_bundle("TestSave", "alice", root=zomboid, mode=BundleMode.AUTO)
+    assert stats1.mode_used == "full"
+
+    # Hôte joue : modifie 1 fichier
+    import time
+    time.sleep(1.1)
+    (zomboid / "Saves" / "Multiplayer" / "TestSave" / "map_0_0.bin").write_bytes(b"played")
+
+    # Push 2 en AUTO → doit être DIFF maintenant (sans pull !)
+    v2, stats2 = repo.push_bundle("TestSave", "alice", root=zomboid, mode=BundleMode.AUTO)
+    assert stats2.mode_used == "diff", \
+        "le 2e push de l'hôte devrait être DIFF grâce au snapshot post-push"
+    assert v2.bundle_mode == "diff"
+    assert v2.parent_bundle_sha256  # référence v1
+    assert v2.size_bytes < v1.size_bytes  # gain effectif
+
+
+def test_push_diff_then_next_push_also_diff(tmp_path, monkeypatch):
+    """Après un push DIFF, un nouveau snapshot post-push doit aussi être créé
+    pour permettre le DIFF suivant (chaîne DIFF → DIFF → DIFF).
+    """
+    src_zomboid = tmp_path / "src"
+    _make_minimal_zomboid(src_zomboid)
+    for i in range(20):
+        (src_zomboid / "Saves" / "Multiplayer" / "TestSave" / f"map_{i}_{i}.bin").write_bytes(
+            b"x" * 1024
+        )
+    repo = SharedRepo(tmp_path / "shared")
+
+    # Seed FULL côté Alice
+    v1, _ = repo.push_bundle("TestSave", "alice", root=src_zomboid, mode=BundleMode.AUTO)
+
+    # Alice joue + push DIFF
+    import time
+    (src_zomboid / "Saves" / "Multiplayer" / "TestSave" / "map_0_0.bin").write_bytes(b"play1")
+    time.sleep(1.1)
+    v2, stats2 = repo.push_bundle("TestSave", "alice", root=src_zomboid, mode=BundleMode.AUTO)
+    assert stats2.mode_used == "diff"
+
+    # Alice rejoue + repush DIFF (snapshot post-DIFF doit pointer sur v2)
+    (src_zomboid / "Saves" / "Multiplayer" / "TestSave" / "map_1_1.bin").write_bytes(b"play2")
+    time.sleep(1.1)
+    v3, stats3 = repo.push_bundle("TestSave", "alice", root=src_zomboid, mode=BundleMode.AUTO)
+    assert stats3.mode_used == "diff", "chaîne DIFF → DIFF cassée"
+    # v3 doit référencer v2 comme parent (et pas v1)
+    v2_manifest = bundle_mod.read_manifest(repo.versions_dir / v2.filename)
+    assert v3.parent_bundle_sha256 == v2_manifest.sha256
 
 
 # --------- PushStats ---------

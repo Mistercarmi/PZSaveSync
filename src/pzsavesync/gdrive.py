@@ -432,7 +432,12 @@ class GDriveRepo:
         from pzsavesync import bundle as bundle_mod
         from pzsavesync.bundle import BundleMode
         from pzsavesync.diff_errors import DiffTooBigError
-        from pzsavesync.sync import PushStats, Version, _estimate_full_bundle_size
+        from pzsavesync.sync import (
+            PushStats,
+            Version,
+            _estimate_full_bundle_size,
+            _try_create_snapshot_post_push,
+        )
 
         self.init_if_needed()
         full_size_estimate = _estimate_full_bundle_size(save_name, root)
@@ -502,6 +507,15 @@ class GDriveRepo:
                 if manifest.bundle_mode == "diff" else 0
             ),
         )
+
+        # Snapshot post-push : débloque le DIFF au prochain push sans pull intermédiaire.
+        _try_create_snapshot_post_push(
+            save_name=save_name,
+            bundle_filename=filename,
+            manifest=manifest,
+            root=root,
+        )
+
         return version, stats
 
     # ---------- pull ----------

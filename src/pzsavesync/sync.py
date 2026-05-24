@@ -41,6 +41,52 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _try_create_snapshot_post_push(
+    save_name: str,
+    bundle_filename: str,
+    manifest: "bundle_mod.BundleManifest",
+    root: Path | None,
+) -> None:
+    """Crée un snapshot post-push pour habiliter le push DIFF suivant sans
+    nécessiter un pull intermédiaire.
+
+    Cas d'usage typique : l'hôte initial pousse le seed FULL puis continue de
+    jouer. Sans ce snapshot, son 2e push serait encore un FULL (54k fichiers)
+    parce que `find_latest_snapshot_for_save` ne trouverait rien.
+
+    Best-effort : échec = warning logué, push reste OK.
+
+    Optimisation : en mode DIFF, on réutilise `manifest.expected_save_files`
+    (déjà calculé pendant le diff) au lieu de re-walker + re-hasher la save.
+    En mode FULL, on doit hasher (~30s sur grosse save) — coût accepté pour
+    débloquer le DIFF du push suivant.
+    """
+    try:
+        actual_root = root or bundle_mod.zomboid_root()
+        save_dir = actual_root / "Saves" / "Multiplayer" / save_name
+        if manifest.bundle_mode == "diff" and manifest.expected_save_files:
+            # On a déjà tous les hash actuels via diff.current_hashes
+            snap = snapshot_mod.Snapshot(
+                save_name=save_name,
+                parent_bundle_sha256=manifest.sha256,
+                parent_bundle_filename=bundle_filename,
+                created_at=dt.datetime.now().isoformat(timespec="seconds"),
+                save_files=dict(manifest.expected_save_files),
+            )
+        else:
+            snap = snapshot_mod.compute_snapshot(
+                save_dir=save_dir,
+                save_name=save_name,
+                parent_sha=manifest.sha256,
+                parent_filename=bundle_filename,
+            )
+        snapshot_mod.save_snapshot(snap)
+    except Exception as e:
+        _log.warning(
+            "Snapshot post-push échoué (%s) — prochain push DIFF nécessitera un pull", e,
+        )
+
+
 def _estimate_full_bundle_size(save_name: str, root: Path | None) -> int:
     """Estime la taille (uncompressed) qu'aurait un bundle FULL pour cette save.
 
@@ -530,6 +576,15 @@ class SharedRepo:
                 if manifest.bundle_mode == "diff" else 0
             ),
         )
+
+        # Snapshot post-push : permet le DIFF au prochain push sans pull intermédiaire.
+        _try_create_snapshot_post_push(
+            save_name=save_name,
+            bundle_filename=filename,
+            manifest=manifest,
+            root=root,
+        )
+
         return version, stats
 
     def _resolve_mode_and_snapshot(

@@ -56,6 +56,10 @@ class Profile:
     save_name: str = ""
     save_type: str = "Multiplayer"
     discord_webhook: str = ""
+    # v0.5.0 — Google Drive direct
+    provider: str = "local"          # "local" | "gdrive"
+    gdrive_folder_id: str = ""       # ID extrait de l'URL Drive partagée
+    gdrive_folder_name: str = ""     # nom affiché (mis en cache après connexion)
 
     def to_dict(self) -> dict:
         return asdict(self)

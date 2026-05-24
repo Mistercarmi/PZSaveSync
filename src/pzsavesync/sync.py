@@ -774,19 +774,14 @@ class SharedRepo:
 # ============================================================ factory
 
 def make_repo(cfg) -> "SharedRepo":
-    """Retourne un SharedRepo (local) ou GDriveRepo selon la config du profil actif.
+    """Retourne le SharedRepo pour le profil actif.
 
-    Utilisé par la GUI et les tests pour éviter de dupliquer le branchement local/Drive.
+    Utilisé par la GUI pour centraliser la construction du repo.
     """
     prof = cfg.current
-    if prof.provider == "gdrive" and prof.gdrive_folder_id:
-        from pzsavesync.gdrive import GDriveClient, GDriveRepo
-        from pzsavesync.config import APP_DIR
-        client = GDriveClient(APP_DIR)
-        return GDriveRepo(prof.gdrive_folder_id, client)
     if not prof.shared_folder:
         raise ValueError(
             "Aucun dossier partagé configuré.\n"
-            "Configure un dossier local ou un lien Google Drive dans l'onglet Réglages."
+            "Configure un dossier dans l'onglet Réglages."
         )
     return SharedRepo(Path(prof.shared_folder))

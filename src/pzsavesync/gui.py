@@ -1047,17 +1047,14 @@ class App(*_AppBase):
         )
         b_browse.grid(row=3, column=2, padx=6, pady=(0, 14))
 
-        # --- Google Drive direct ---
+        # --- Google Drive via Drive for Desktop ---
         ctk.CTkLabel(
-            grid, text="🌐   GOOGLE DRIVE (lien direct)",
+            grid, text="🟢   GOOGLE DRIVE (via Drive for Desktop)",
             font=("Segoe UI", 11, "bold"), anchor="w",
             text_color=COLOR_TEXT_MUTED,
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 4))
 
-        prof = self.cfg.current
-        self.gdrive_url_var = ctk.StringVar(
-            value=prof.gdrive_folder_id if prof.provider == "gdrive" else ""
-        )
+        self.gdrive_url_var = ctk.StringVar()
         e_gdrive = ctk.CTkEntry(
             grid, textvariable=self.gdrive_url_var, width=420, height=34,
             placeholder_text="https://drive.google.com/drive/folders/...",
@@ -1065,46 +1062,28 @@ class App(*_AppBase):
         )
         e_gdrive.grid(row=5, column=0, sticky="w", padx=14, pady=(0, 4))
         tip(e_gdrive,
-            "Colle ici le lien de ton dossier Google Drive partagé. "
-            "L'app accède directement à Drive sans avoir besoin de Drive for Desktop.")
+            "Colle le lien de ton dossier Drive partagé. "
+            "Clique ensuite '📂 Ouvrir dans Drive' pour naviguer directement "
+            "au bon endroit et choisir le dossier.")
 
-        b_gdrive_connect = ctk.CTkButton(
-            grid, text="🔗  Connecter", width=110, height=34,
-            command=self._connect_gdrive,
+        b_gdrive_open = ctk.CTkButton(
+            grid, text="📂  Ouvrir dans Drive", width=140, height=34,
+            command=self._open_in_gdrive,
             fg_color="#1a73e8", hover_color="#1557b0",
             font=("Segoe UI", 10),
         )
-        b_gdrive_connect.grid(row=5, column=1, padx=6, pady=(0, 4))
-        tip(b_gdrive_connect,
-            "Lance l'authentification Google OAuth2 dans le navigateur. "
-            "Le token est stocké localement pour les prochains push/pull.")
-
-        # Statut connexion Drive
-        gdrive_status_text = ""
-        if prof.provider == "gdrive" and prof.gdrive_folder_id:
-            folder_name = prof.gdrive_folder_name or prof.gdrive_folder_id
-            gdrive_status_text = f"✓  Connecté — {folder_name}"
-        self.gdrive_status_label = ctk.CTkLabel(
-            grid, text=gdrive_status_text,
-            font=("Segoe UI", 10), anchor="w",
-            text_color=COLOR_OK if gdrive_status_text else COLOR_TEXT_MUTED,
-        )
-        self.gdrive_status_label.grid(row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 10))
-
-        b_gdrive_disconnect = ctk.CTkButton(
-            grid, text="🔌  Déconnecter", width=120, height=28,
-            command=self._disconnect_gdrive,
-            fg_color=COLOR_BAD, hover_color="#c0392b",
-            font=("Segoe UI", 10),
-        )
-        b_gdrive_disconnect.grid(row=6, column=2, padx=6, pady=(0, 10))
-        tip(b_gdrive_disconnect, "Supprime le token local et repasse en mode dossier local.")
+        b_gdrive_open.grid(row=5, column=1, padx=6, pady=(0, 4))
+        tip(b_gdrive_open,
+            "Ouvre le sélecteur de dossier directement dans ton Google Drive "
+            "(monté localement par Drive for Desktop). "
+            "Sélectionne le dossier partagé avec tes potes.")
 
         ctk.CTkLabel(
-            grid, text="ℹ  Si un lien Drive est configuré, il remplace le dossier local pour ce profil.",
+            grid,
+            text="ℹ  Nécessite Google Drive for Desktop. Le dossier sélectionné remplace le chemin local.",
             font=("Segoe UI", 9), anchor="w",
             text_color=COLOR_TEXT_DIM,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 8))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 8))
 
         # --- Préférences avancées ---
         ctk.CTkLabel(
@@ -1399,73 +1378,48 @@ class App(*_AppBase):
         if path:
             self.folder_var.set(path)
 
-    def _connect_gdrive(self):
-        """Valide l'URL Drive, déclenche l'auth OAuth2 et met à jour le profil."""
-        from pzsavesync.gdrive import GDriveClient, GDriveAuthError, parse_folder_id
-        from pzsavesync.config import APP_DIR
+    def _open_in_gdrive(self):
+        """Ouvre le sélecteur de dossier directement dans Google Drive for Desktop.
 
-        raw = self.gdrive_url_var.get().strip() if hasattr(self, "gdrive_url_var") else ""
-        if not raw:
-            messagebox.showerror(
-                "URL manquante",
-                "Colle d'abord le lien de ton dossier Google Drive dans le champ ci-dessus.",
-            )
+        Si une URL Drive a été collée, on l'utilise pour informer l'utilisateur.
+        On détecte la racine Drive (registre + scan lettres) et on ouvre le
+        file browser à cet endroit. Le chemin choisi devient le dossier partagé.
+        """
+        raw_url = self.gdrive_url_var.get().strip() if hasattr(self, "gdrive_url_var") else ""
+
+        # Trouver la racine Drive for Desktop
+        gdrive_root = cloud_detect.find_best_gdrive_root()
+
+        if gdrive_root is None:
+            # Aucun Drive for Desktop détecté — proposer de continuer avec Parcourir
+            if messagebox.askyesno(
+                "Google Drive for Desktop non détecté",
+                "Drive for Desktop n'est pas installé ou introuvable sur ce PC.\n\n"
+                "Installe-le depuis drive.google.com/drive/download et réessaie,\n"
+                "ou clique Oui pour parcourir manuellement.",
+            ):
+                self._browse()
             return
 
-        try:
-            folder_id = parse_folder_id(raw)
-        except ValueError as e:
-            messagebox.showerror("URL invalide", str(e))
-            return
+        # Ouvrir le sélecteur dans la racine Drive
+        if raw_url:
+            folder_id = cloud_detect.parse_folder_id_from_url(raw_url)
+            if folder_id:
+                title = "Navigue vers ton dossier partagé dans Google Drive"
+            else:
+                title = "Choisis ton dossier partagé dans Google Drive"
+        else:
+            title = "Choisis ton dossier partagé dans Google Drive"
 
-        client = GDriveClient(APP_DIR)
-        try:
-            client.authenticate()
-            folder_name = client.get_folder_name(folder_id)
-        except GDriveAuthError as e:
-            messagebox.showerror("Erreur authentification Google", str(e))
-            return
-        except Exception as e:
-            messagebox.showerror("Erreur Drive", str(e))
-            return
-
-        prof = self.cfg.current
-        prof.provider = "gdrive"
-        prof.gdrive_folder_id = folder_id
-        prof.gdrive_folder_name = folder_name
-        config.save(self.cfg)
-        self.refresh_all()
-
-        if hasattr(self, "gdrive_status_label"):
-            self.gdrive_status_label.configure(
-                text=f"✓  Connecté — {folder_name}", text_color="#2ecc71",
-            )
-        messagebox.showinfo(
-            "Google Drive connecté",
-            f"Dossier : {folder_name}\n\nLes prochains push/pull utiliseront Drive directement.",
+        path = filedialog.askdirectory(
+            title=title,
+            initialdir=str(gdrive_root),
         )
-
-    def _disconnect_gdrive(self):
-        """Déconnecte Drive et repasse en mode dossier local."""
-        from pzsavesync.gdrive import GDriveClient
-        from pzsavesync.config import APP_DIR
-        if not messagebox.askyesno(
-            "Déconnecter Google Drive",
-            "Supprimer le token Drive et repasser en mode dossier local ?",
-        ):
-            return
-        GDriveClient(APP_DIR).revoke()
-        prof = self.cfg.current
-        prof.provider = "local"
-        prof.gdrive_folder_id = ""
-        prof.gdrive_folder_name = ""
-        config.save(self.cfg)
-        self.refresh_all()
-        if hasattr(self, "gdrive_status_label"):
-            self.gdrive_status_label.configure(text="", text_color="#888888")
-        if hasattr(self, "gdrive_url_var"):
-            self.gdrive_url_var.set("")
-        messagebox.showinfo("Déconnecté", "Token Drive supprimé. Mode dossier local actif.")
+        if path:
+            self.folder_var.set(path)
+            # Effacer le champ URL (il a servi de hint, le vrai chemin est maintenant dans folder_var)
+            if hasattr(self, "gdrive_url_var"):
+                self.gdrive_url_var.set("")
 
     def _save_cfg(self):
         self.cfg.player_name = self.name_var.get().strip()
@@ -1715,11 +1669,7 @@ class App(*_AppBase):
             self.header_user.configure(
                 text="👤  (pseudo non défini)", text_color=COLOR_TEXT_MUTED,
             )
-        prof = self.cfg.current
-        if prof.provider == "gdrive" and prof.gdrive_folder_id:
-            folder_name = prof.gdrive_folder_name or prof.gdrive_folder_id
-            self.header_cloud.configure(text=f"☁  Drive: {folder_name}", text_color=COLOR_TEXT)
-        elif self.cfg.shared_folder:
+        if self.cfg.shared_folder:
             shown = self.cfg.shared_folder
             if len(shown) > 42:
                 shown = "…" + shown[-39:]
@@ -2217,10 +2167,7 @@ class App(*_AppBase):
 
     # ====================================================== cloud / history
     def _refresh_cloud(self):
-        prof = self.cfg.current
-        has_local = bool(prof.shared_folder)
-        has_gdrive = prof.provider == "gdrive" and bool(prof.gdrive_folder_id)
-        if not has_local and not has_gdrive:
+        if not self.cfg.shared_folder:
             self.cloud_lock_big.configure(
                 text="🔓  Dossier partagé non configuré",
                 text_color=COLOR_TEXT_MUTED,
@@ -2806,8 +2753,7 @@ class App(*_AppBase):
     def _cleanup_orphan_tmp(self):
         """Au démarrage, nettoie les .tmp orphelins (résidus d'opérations crashées)."""
         try:
-            prof = self.cfg.current
-            if not prof.shared_folder and not (prof.provider == "gdrive" and prof.gdrive_folder_id):
+            if not self.cfg.shared_folder:
                 return
             repo = make_repo(self.cfg)
             deleted = repo.cleanup_orphan_tmp_files()
@@ -2904,8 +2850,7 @@ class App(*_AppBase):
         v0.3.6, on rglobait la save_dir une 2e fois (~secondes de freeze UI
         sur les saves de 50k+ chunks).
         """
-        prof = self.cfg.current
-        if not self.cfg.save_name or (not prof.shared_folder and not prof.gdrive_folder_id):
+        if not self.cfg.save_name or not self.cfg.shared_folder:
             return None
         try:
             repo = make_repo(self.cfg)
